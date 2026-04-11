@@ -12,6 +12,10 @@ main ()
     DWNLD_DIR="/tmp"                    # Location to place artifacts
     FF_PROFILE_NAME="old_ff_profile"    # Location to save old Firefox profile
 
+    ERR_COLOR='\033[0;31m'              # Red for error messages
+    INFO_COLOR='\033[0;33m'             # Yellow for notes
+    NO_COLOR='\033[0m'                  # Revert terminal back to no color
+
     chrome_exists=false                 # Google Chrome is installed
     ff_exists=false                     # Firefox is installed
     snap_ff=false                       # Flag to prompt for how to handle snap Firefox
@@ -43,12 +47,9 @@ main ()
         fi
     else
         # Database was found. (Good)
-        if [ "$snap_ff" == true ]
-        then
-            # Database was found, meaning snap firefox was replaced with apt version
-            # This conditional branch may not be needed at all... Note: Remove if not needed
-            snap_ff=false
-        fi
+        # If Firefox was replaced from snap to apt, the snap_ff flag is no longer
+        # relevant since we now have a valid database from the apt version.
+        snap_ff=false
     fi
 
     # Install middleware and necessary utilities
@@ -94,8 +95,7 @@ main ()
 
     # Remove artifacts
     print_info "Removing artifacts..."
-    rm -rf "${DWNLD_DIR:?}"/{"$BUNDLE_FILENAME","$CERT_FILENAME","$FF_PROFILE_NAME"} 2>/dev/null
-    if [ "$?" -ne "$EXIT_SUCCESS" ]
+    if ! rm -rf "${DWNLD_DIR:?}"/{"$BUNDLE_FILENAME","$CERT_FILENAME","$FF_PROFILE_NAME"} 2>/dev/null
     then
         print_err "Failed to remove artifacts. Artifacts were stored in ${DWNLD_DIR}."
     else
@@ -109,8 +109,6 @@ main ()
 # Prints message with red [ERROR] tag before the message
 print_err ()
 {
-    ERR_COLOR='\033[0;31m'  # Red for error messages
-    NO_COLOR='\033[0m'      # Revert terminal back to no color
     echo -e "${ERR_COLOR}[ERROR]${NO_COLOR} $1"
 } # print_err
 
@@ -118,8 +116,6 @@ print_err ()
 # Prints message with yellow [INFO] tag before the message
 print_info ()
 {
-    INFO_COLOR='\033[0;33m' # Yellow for notes
-    NO_COLOR='\033[0m'      # Revert terminal back to no color
     echo -e "${INFO_COLOR}[INFO]${NO_COLOR} $1"
 } # print_info
 
@@ -256,11 +252,11 @@ browser_check ()
             then
                 reconfigure_firefox
             else
-                if [ $chrome_exists == false ]
+                if [ "$chrome_exists" == false ]
                 then
                     print_info "You have elected to keep the snap version of Firefox.\n"
                     print_err "You have no compatible browsers. Exiting..."
-                    exit $E_BROWSER
+                    exit "$E_BROWSER"
                 fi
             fi
         fi
@@ -291,7 +287,7 @@ backup_ff_profile ()
             print_info "Backing up Firefox profile"
             ff_profile="$(dirname "$location")"
             sudo -H -u "$SUDO_USER" cp -rf "$ff_profile" "$DWNLD_DIR/$FF_PROFILE_NAME"
-            backup_exists=1
+            backup_exists=true
         fi
 
     fi
@@ -447,6 +443,7 @@ check_for_ff_pin ()
     if echo "$XDG_CURRENT_DESKTOP" | grep -qi "GNOME"
     then
         print_info "Detected GNOME-based desktop environment"
+        curr_favorites=$(gsettings get org.gnome.shell favorite-apps)
         if echo "$curr_favorites" | grep -q "firefox.desktop"
         then
             ff_was_pinned=true
@@ -464,7 +461,6 @@ repin_firefox ()
     print_info "Attempting to repin Firefox to favorites bar..."
     if [ "$ff_was_pinned" == true ]
     then
-        curr_favorites=$(gsettings get org.gnome.shell favorite-apps)
         print_info "Pinning Firefox to favorites bar"
         gsettings set org.gnome.shell favorite-apps "$(gsettings get org.gnome.shell favorite-apps | sed s/.$//), 'firefox.desktop']"
         print_info "Done."

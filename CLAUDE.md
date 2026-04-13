@@ -4,7 +4,7 @@ Guide for AI assistants working on the **linux_cac** repository.
 
 ## Project Overview
 
-**linux_cac** is a Bash script that automates Common Access Card (CAC) configuration on Debian-based Linux distributions. It installs middleware, downloads DoD certificates, imports them into browser certificate databases, and registers the PKCS#11 module — enabling smart card authentication in Firefox and Chrome.
+**linux_cac** is a Bash script that automates Common Access Card (CAC) configuration on Linux distributions (Debian/Ubuntu, Fedora/RHEL/CentOS, and Arch Linux). It installs middleware, downloads DoD certificates, imports them into browser certificate databases, and registers the PKCS#11 module — enabling smart card authentication in Firefox and Chrome.
 
 The project uses OpenSC (migrated from Cackey) for PKCS#11 support.
 
@@ -12,7 +12,7 @@ The project uses OpenSC (migrated from Cackey) for PKCS#11 support.
 
 ```
 linux_cac/
-├── cac_setup.sh                 # Main script (single entry point, ~475 lines)
+├── cac_setup.sh                 # Main script (single entry point, ~570 lines)
 ├── .github/workflows/CI.yml     # GitHub Actions: ShellCheck static analysis
 ├── README.md                    # User-facing documentation
 ├── LICENSE                      # MIT License (2022-2025, Jeremy Jackson)
@@ -38,20 +38,21 @@ This is the only automated quality check. All ShellCheck warnings must be resolv
 
 ## Script Architecture
 
-`cac_setup.sh` follows a top-level `main()` function pattern — `main` is defined first and called at the bottom of the file (line 475).
+`cac_setup.sh` follows a top-level `main()` function pattern — `main` is defined first and called at the bottom of the file (line 570).
 
 ### Execution Flow
 
-1. `root_check()` — Verify root/sudo privileges
-2. `browser_check()` — Detect Firefox (snap vs apt) and Chrome
-3. If snap Firefox: prompt user to replace with apt version via `reconfigure_firefox()`
-4. Locate `cert9.db` databases in user's home directory
-5. Install middleware packages via `apt`
-6. Download DoD certificates from `militarycac.com`
-7. Import certificates into each browser's database via `certutil`
-8. Register CAC module with `pkcs11-register`
-9. Enable `pcscd.socket` service
-10. Clean up temporary artifacts
+1. `detect_os()` — Identify Linux distribution family (debian/fedora/arch)
+2. `root_check()` — Verify root/sudo privileges
+3. `browser_check()` — Detect Firefox (snap vs apt) and Chrome
+4. If snap Firefox (Debian only): prompt user to replace with apt version via `reconfigure_firefox()`
+5. Locate `cert9.db` databases in user's home directory
+6. `install_packages()` — Install middleware via the appropriate package manager (apt/dnf/pacman)
+7. Download DoD certificates from `militarycac.com`
+8. Import certificates into each browser's database via `certutil`
+9. `register_pkcs11()` — Register CAC module (pkcs11-register on Debian, p11-kit verification on Fedora/Arch)
+10. Enable `pcscd.socket` service
+11. Clean up temporary artifacts
 
 ### Key Functions
 
@@ -71,6 +72,9 @@ This is the only automated quality check. All ShellCheck warnings must be resolv
 | `repin_firefox()` | Re-pins Firefox after reinstall |
 | `revert_firefox()` | Rolls back to snap Firefox on failure |
 | `print_err()` / `print_info()` | Colored output helpers (red/yellow) |
+| `detect_os()` | Detects Linux distro family from /etc/os-release |
+| `install_packages()` | Installs middleware via apt, dnf, or pacman |
+| `register_pkcs11()` | Registers PKCS#11 module (method varies by OS family) |
 
 ### Exit Codes
 
@@ -80,6 +84,7 @@ This is the only automated quality check. All ShellCheck warnings must be resolv
 | 86 | `E_NOTROOT` | Script not run as root |
 | 87 | `E_BROWSER` | No compatible browser found |
 | 88 | `E_DATABASE` | No cert9.db database located |
+| 89 | `E_DISTRO` | Unsupported Linux distribution |
 
 ### Key Variables
 
@@ -87,6 +92,7 @@ This is the only automated quality check. All ShellCheck warnings must be resolv
 - `DWNLD_DIR` — Temp directory for artifacts (`/tmp`)
 - `DB_FILENAME` — Certificate database name (`cert9.db`)
 - `CERT_URL` — DoD certificate bundle URL (HTTPS)
+- `OS_FAMILY` — Detected distribution family (`debian`, `fedora`, or `arch`)
 - `snap_ff` / `ff_exists` / `chrome_exists` — Boolean flags controlling flow
 
 ## Code Conventions
@@ -122,9 +128,21 @@ Prompts use a `while` loop validating input is exactly `"y"` or `"n"`.
 
 ## System Dependencies
 
-Packages installed by the script:
+Packages installed by the script (varies by OS family):
+
+**Debian/Ubuntu:**
 ```
 libpcsclite1 pcscd libccid libpcsc-perl pcsc-tools libnss3-tools unzip wget opensc
+```
+
+**Fedora/RHEL/CentOS:**
+```
+pcsc-lite pcsc-lite-ccid opensc nss-tools unzip wget pcsc-tools
+```
+
+**Arch Linux:**
+```
+pcsclite ccid opensc nss unzip wget pcsc-tools
 ```
 
 ## Supported Configurations
@@ -157,7 +175,10 @@ Per README.md:
 ## Common Tasks
 
 ### Adding a new supported distribution
-Update the table in `README.md` under "Supported Configurations" after testing.
+1. Add detection logic in `detect_os()` to recognize the distro's ID/ID_LIKE values
+2. Add a case in `install_packages()` for the distro's package manager and package names
+3. Add a case in `register_pkcs11()` for the distro's PKCS#11 registration method
+4. Update the table in `README.md` under "Supported Configurations" after testing
 
 ### Adding a new browser
 1. Add a detection function (like `check_for_firefox` / `check_for_chrome`)
@@ -180,7 +201,8 @@ Document why the suppression is necessary.
 ## Important Notes
 
 - The script must be run as root (`sudo`) because it installs system packages and modifies system services
+- Snap Firefox handling (detection, replacement, revert) only applies to Debian-family systems
 - Snap Firefox is incompatible with the certificate import method — the script offers to replace it with the apt version from Mozilla's PPA
 - The script downloads certificates from an external URL (`militarycac.com`) — changes to that upstream source may break functionality
-- `pkcs11-register` behavior can be unreliable in scripted contexts (documented known issue)
+- `pkcs11-register` (Debian) behavior can be unreliable in scripted contexts (documented known issue); Fedora/Arch use `p11-kit` verification instead
 - All temporary artifacts are stored in `/tmp` and cleaned up on exit

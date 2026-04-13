@@ -16,10 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Install Shellcheck
-        run: sudo apt install -y shellcheck
+        uses: actions/checkout@v4
 
       - name: Run ShellCheck with -x flag
         run: shellcheck -x cac_setup.sh

@@ -3,31 +3,34 @@
 # cac_setup.sh
 # Description: Setup a Linux environment for Common Access Card use.
 
+# Constants
+EXIT_SUCCESS=0                      # Success exit code
+E_NOTROOT=86                        # Non-root exit error
+E_BROWSER=87                        # Compatible browser not found
+E_DATABASE=88                       # No database located
+E_DISTRO=89                         # Unsupported Linux distribution
+DWNLD_DIR="/tmp"                    # Location to place artifacts
+FF_PROFILE_NAME="old_ff_profile"    # Location to save old Firefox profile
+
+ERR_COLOR='\033[0;31m'              # Red for error messages
+INFO_COLOR='\033[0;33m'             # Yellow for notes
+NO_COLOR='\033[0m'                  # Revert terminal back to no color
+
+DB_FILENAME="cert9.db"
+CERT_EXTENSION="cer"
+CERT_FILENAME="AllCerts"
+BUNDLE_FILENAME="AllCerts.zip"
+
 main ()
 {
-    EXIT_SUCCESS=0                      # Success exit code
-    E_NOTROOT=86                        # Non-root exit error
-    E_BROWSER=87                        # Compatible browser not found
-    E_DATABASE=88                       # No database located
-    E_DISTRO=89                         # Unsupported Linux distribution
-    DWNLD_DIR="/tmp"                    # Location to place artifacts
-    FF_PROFILE_NAME="old_ff_profile"    # Location to save old Firefox profile
-
-    ERR_COLOR='\033[0;31m'              # Red for error messages
-    INFO_COLOR='\033[0;33m'             # Yellow for notes
-    NO_COLOR='\033[0m'                  # Revert terminal back to no color
-
     chrome_exists=false                 # Google Chrome is installed
     ff_exists=false                     # Firefox is installed
     snap_ff=false                       # Flag to prompt for how to handle snap Firefox
+    backup_exists=false                 # Whether a Firefox profile backup was made
+    ff_was_pinned=false                 # Whether Firefox was pinned in GNOME favorites
     OS_FAMILY=""                        # Detected OS family (debian/fedora/arch)
 
     ORIG_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
-    CERT_EXTENSION="cer"
-    # PKCS_FILENAME="pkcs11.txt"
-    DB_FILENAME="cert9.db"
-    CERT_FILENAME="AllCerts"
-    BUNDLE_FILENAME="AllCerts.zip"
     CERT_URL="https://militarycac.com/maccerts/$BUNDLE_FILENAME"
 
     detect_os
@@ -37,9 +40,9 @@ main ()
     # Exclude snap paths only on Debian-family systems
     if [ "$OS_FAMILY" == "debian" ]
     then
-        mapfile -t databases < <(find "$ORIG_HOME" -name "$DB_FILENAME" 2>/dev/null | grep "firefox\|pki" | grep -v "Trash\|snap")
+        mapfile -t databases < <(find_db "firefox\|pki" "snap")
     else
-        mapfile -t databases < <(find "$ORIG_HOME" -name "$DB_FILENAME" 2>/dev/null | grep "firefox\|pki" | grep -v "Trash")
+        mapfile -t databases < <(find_db "firefox\|pki")
     fi
 
     # Check if databases were found properly
@@ -70,14 +73,18 @@ main ()
 
     # Pull all necessary files
     print_info "Downloading DoD certificates..."
-    wget -qP "$DWNLD_DIR" "$CERT_URL"
+    if ! wget -qP "$DWNLD_DIR" "$CERT_URL"
+    then
+        print_err "Failed to download DoD certificates from $CERT_URL"
+        exit 1
+    fi
     print_info "Done."
 
     # Unzip cert bundle
     if [ -e "$DWNLD_DIR/$BUNDLE_FILENAME" ]
     then
         mkdir -p "$DWNLD_DIR/$CERT_FILENAME"
-        unzip "$DWNLD_DIR/$BUNDLE_FILENAME" -d "$DWNLD_DIR/$CERT_FILENAME"
+        unzip -qo "$DWNLD_DIR/$BUNDLE_FILENAME" -d "$DWNLD_DIR/$CERT_FILENAME"
     fi
 
     # Import certificates into cert9.db databases for browsers
@@ -90,12 +97,6 @@ main ()
     done
 
     register_pkcs11
-
-    # NOTE: Keeping this temporarily to test `pkcs11-register`.
-    # if ! grep -Pzo 'library=/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so\nname=CAC Module\n' "$db_root/$PKCS_FILENAME" >/dev/null
-    # then
-    #     printf "library=/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so\nname=CAC Module\n" >> "$db_root/$PKCS_FILENAME"
-    # fi
 
     print_info "Enabling pcscd service to start on boot..."
     systemctl enable pcscd.socket
@@ -116,6 +117,41 @@ main ()
 
     exit "$EXIT_SUCCESS"
 } # main
+
+
+# Find cert9.db databases, excluding Trash directories
+# Usage: find_db [include_filter] [exclude_filter]
+find_db ()
+{
+    local include="${1:-}"
+    local exclude="${2:-}"
+    local results
+    results=$(find "$ORIG_HOME" -name "$DB_FILENAME" 2>/dev/null | grep -v "Trash")
+
+    if [ -n "$include" ]
+    then
+        results=$(echo "$results" | grep "$include")
+    fi
+    if [ -n "$exclude" ]
+    then
+        results=$(echo "$results" | grep -v "$exclude")
+    fi
+    echo "$results"
+} # find_db
+
+
+# Gracefully terminate a process, falling back to SIGKILL
+graceful_kill ()
+{
+    local process_name="$1"
+    pkill "$process_name" 2>/dev/null
+    sleep 2
+    if pgrep "$process_name" >/dev/null 2>&1
+    then
+        pkill -9 "$process_name" 2>/dev/null
+    fi
+    sleep 1
+} # graceful_kill
 
 
 # Prints message with red [ERROR] tag before the message
@@ -192,23 +228,17 @@ run_firefox ()
     print_info "Starting Firefox silently to complete post-install actions..."
     sudo -H -u "$SUDO_USER" firefox --headless --first-startup >/dev/null 2>&1 &
     sleep 3
-    pkill -9 firefox
-    sleep 1
+    graceful_kill firefox
 } # run_firefox
 
 
 # Run Chrome to ensure .pki directory has been created
 run_chrome ()
 {
-    # NOTE: this is the original
-    # sudo -H -u "$SUDO_USER" bash -c 'google-chrome --headless --disable-gpu >/dev/null 2>&1 &'
-
-    # TODO: finish troubleshooting this
     print_info "Running Chrome to ensure it has completed post-install actions..."
     sudo -H -u "$SUDO_USER" google-chrome --headless --disable-gpu >/dev/null 2>&1 &
     sleep 3
-    pkill -9 google-chrome
-    sleep 1
+    graceful_kill google-chrome
     print_info "Done."
 } # run_chrome
 
@@ -281,7 +311,8 @@ browser_check ()
 # apt version of Firefox has been installed
 backup_ff_profile ()
 {
-    location="$(find "$ORIG_HOME" -name "$DB_FILENAME" 2>/dev/null | grep "firefox" | grep -v "Trash" | grep snap)"
+    local location
+    location="$(find_db "firefox" | grep "snap")"
     if [ -z "$location" ]
     then
         print_info "No user profile was found in snap-installed version of Firefox."
@@ -308,20 +339,20 @@ backup_ff_profile ()
 
 # Moves the user's backed up Firefox profile from the temp location to the newly
 # installed apt version of Firefox in the ~/.mozilla directory
-# TODO: Take arguments for source and destination so profile can be restored to
-#       original location in the event of a failed install
 migrate_ff_profile ()
 {
-    direction=$1
+    local direction=$1
 
     if [ "$direction" == "migrate" ]
     then
-        apt_ff_profile="$(find "$ORIG_HOME" -name "$DB_FILENAME" 2>/dev/null | grep "firefox" | grep -v "Trash" | grep -v snap)"
+        local apt_ff_profile
+        apt_ff_profile="$(find_db "firefox" | grep -v "snap")"
         if [ -z "$apt_ff_profile" ]
         then
             print_err "Something went wrong while trying to find apt Firefox's user profile directory."
             exit "$E_DATABASE"
         else
+            local ff_profile_dir
             ff_profile_dir="$(dirname "$apt_ff_profile")"
             if sudo -H -u "$SUDO_USER" cp -rf "$DWNLD_DIR/$FF_PROFILE_NAME"/* "$ff_profile_dir"
             then
@@ -332,12 +363,14 @@ migrate_ff_profile ()
         fi
     elif [ "$direction" == "restore" ]
     then
-        location="$(find "$ORIG_HOME" -name "$DB_FILENAME" 2>/dev/null | grep "firefox" | grep -v "Trash" | grep snap)"
+        local location
+        location="$(find_db "firefox" | grep "snap")"
         if [ -z "$location" ]
         then
             print_info "No user profile was found in snap-installed version of Firefox."
         else
-            ff_profile_dir="$(dirname "$apt_ff_profile")"
+            local ff_profile_dir
+            ff_profile_dir="$(dirname "$location")"
             if sudo -H -u "$SUDO_USER" cp -rf "$DWNLD_DIR/$FF_PROFILE_NAME"/* "$ff_profile_dir"
             then
                 print_info "Successfully restored user profile for Firefox"
@@ -362,7 +395,7 @@ check_for_firefox ()
         print_info "Found Firefox."
         if [ "$OS_FAMILY" == "debian" ]
         then
-            if echo "$ff_path" | grep snap >/dev/null
+            if [[ "$ff_path" =~ snap ]]
             then
                 snap_ff=true
                 print_err "This version of Firefox was installed as a snap package"
@@ -462,11 +495,11 @@ check_for_ff_pin ()
         return
     fi
 
-    if echo "$XDG_CURRENT_DESKTOP" | grep -qi "GNOME"
+    if [[ "$XDG_CURRENT_DESKTOP" =~ [Gg][Nn][Oo][Mm][Ee] ]]
     then
         print_info "Detected GNOME-based desktop environment"
         curr_favorites=$(gsettings get org.gnome.shell favorite-apps)
-        if echo "$curr_favorites" | grep -q "firefox.desktop"
+        if [[ "$curr_favorites" =~ firefox\.desktop ]]
         then
             ff_was_pinned=true
         fi
@@ -506,13 +539,13 @@ detect_os ()
     local distro_like="${ID_LIKE:-}"
     local distro_info="$distro_id $distro_like"
 
-    if echo "$distro_info" | grep -qi "debian\|ubuntu"
+    if [[ "$distro_info" =~ [Dd]ebian|[Uu]buntu ]]
     then
         OS_FAMILY="debian"
-    elif echo "$distro_info" | grep -qi "fedora\|rhel\|centos"
+    elif [[ "$distro_info" =~ [Ff]edora|[Rr]hel|[Cc]ent[Oo][Ss] ]]
     then
         OS_FAMILY="fedora"
-    elif echo "$distro_info" | grep -qi "arch"
+    elif [[ "$distro_info" =~ [Aa]rch ]]
     then
         OS_FAMILY="arch"
     else

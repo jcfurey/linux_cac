@@ -21,10 +21,25 @@ CERT_EXTENSION="cer"
 CERT_FILENAME="AllCerts"
 BUNDLE_FILENAME="AllCerts.zip"
 
+# Browser registry — each entry is "DisplayName:binary:db_pattern:type"
+#   db_pattern: grep pattern to match cert9.db paths for this browser
+#   type: "firefox" (Firefox-family) or "chromium" (Chromium-family)
+# To add a new browser, add an entry here. Chromium-based browsers all share
+# the ~/.pki/nssdb/ database, so only one needs to run to initialize it.
+BROWSERS=(
+    "Firefox:firefox:firefox:firefox"
+    "LibreWolf:librewolf:librewolf:firefox"
+    "Waterfox:waterfox:waterfox:firefox"
+    "Google Chrome:google-chrome:pki:chromium"
+    "Chromium:chromium-browser:pki:chromium"
+    "Chromium:chromium:pki:chromium"
+    "Brave:brave-browser:pki:chromium"
+    "Microsoft Edge:microsoft-edge-stable:pki:chromium"
+    "Vivaldi:vivaldi-stable:pki:chromium"
+)
+
 main ()
 {
-    chrome_exists=false                 # Google Chrome is installed
-    ff_exists=false                     # Firefox is installed
     snap_ff=false                       # Flag to prompt for how to handle snap Firefox
     backup_exists=false                 # Whether a Firefox profile backup was made
     ff_was_pinned=false                 # Whether Firefox was pinned in GNOME favorites
@@ -33,16 +48,38 @@ main ()
     ORIG_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
     CERT_URL="https://militarycac.com/maccerts/$BUNDLE_FILENAME"
 
+    # Arrays populated by browser_check
+    found_db_patterns=()                # Database grep patterns for detected browsers
+    found_browsers=()                   # Display names of detected compatible browsers
+
     detect_os
     root_check
+    check_running_browsers
     browser_check
+
+    # Build deduplicated grep pattern from detected browsers
+    local db_pattern=""
+    local -A seen_patterns
+    for p in "${found_db_patterns[@]}"
+    do
+        if [ -z "${seen_patterns[$p]:-}" ]
+        then
+            seen_patterns[$p]=1
+            if [ -n "$db_pattern" ]
+            then
+                db_pattern="$db_pattern\|$p"
+            else
+                db_pattern="$p"
+            fi
+        fi
+    done
 
     # Exclude snap paths only on Debian-family systems
     if [ "$OS_FAMILY" == "debian" ]
     then
-        mapfile -t databases < <(find_db "firefox\|pki" "snap")
+        mapfile -t databases < <(find_db "$db_pattern" "snap")
     else
-        mapfile -t databases < <(find_db "firefox\|pki")
+        mapfile -t databases < <(find_db "$db_pattern")
     fi
 
     # Check if databases were found properly
@@ -54,7 +91,7 @@ main ()
             revert_firefox
         else
             # Firefox was not replaced, exit with E_DATABASE error
-            print_err "No valid databases located. Try running, then closing Firefox, then start this script again."
+            print_err "No valid databases located. Try running, then closing your browser(s), then start this script again."
             echo -e "\tExiting..."
 
             exit "$E_DATABASE"
@@ -140,6 +177,20 @@ find_db ()
 } # find_db
 
 
+# Run a browser headlessly to initialize its profile/database directory
+# Usage: run_browser <binary> <headless_args>
+run_browser ()
+{
+    local binary="$1"
+    local args="$2"
+    print_info "Starting $binary silently to complete post-install actions..."
+    # shellcheck disable=SC2086
+    sudo -H -u "$SUDO_USER" "$binary" $args >/dev/null 2>&1 &
+    sleep 3
+    graceful_kill "$binary"
+} # run_browser
+
+
 # Gracefully terminate a process, falling back to SIGKILL
 graceful_kill ()
 {
@@ -209,7 +260,7 @@ reconfigure_firefox ()
         hash -d firefox
     fi
 
-    run_firefox
+    run_browser "firefox" "--headless --first-startup"
     print_info "Finished, closing Firefox."
 
     if [ "$backup_exists" == true ]
@@ -222,84 +273,178 @@ reconfigure_firefox ()
 } # reconfigure_firefox
 
 
-# Run Firefox to ensure the profile directory has been created
-run_firefox ()
+# Check if any supported browsers are currently running and warn the user.
+# Offers to kill them since the script runs as root.
+check_running_browsers ()
 {
-    print_info "Starting Firefox silently to complete post-install actions..."
-    sudo -H -u "$SUDO_USER" firefox --headless --first-startup >/dev/null 2>&1 &
-    sleep 3
-    graceful_kill firefox
-} # run_firefox
+    local running=""
+    local -a running_binaries=()
+    local -A checked
 
+    for entry in "${BROWSERS[@]}"
+    do
+        IFS=':' read -r name binary _ _ <<< "$entry"
 
-# Run Chrome to ensure .pki directory has been created
-run_chrome ()
-{
-    print_info "Running Chrome to ensure it has completed post-install actions..."
-    sudo -H -u "$SUDO_USER" google-chrome --headless --disable-gpu >/dev/null 2>&1 &
-    sleep 3
-    graceful_kill google-chrome
-    print_info "Done."
-} # run_chrome
+        # Skip if we already checked this binary (e.g. chromium listed twice)
+        if [ -n "${checked[$binary]:-}" ]
+        then
+            continue
+        fi
+        checked[$binary]=1
+
+        if pgrep -f "$binary" >/dev/null 2>&1
+        then
+            running_binaries+=("$binary")
+            if [ -n "$running" ]
+            then
+                running="$running, $name"
+            else
+                running="$name"
+            fi
+        fi
+    done
+
+    if [ -n "$running" ]
+    then
+        print_err "Running browser(s) detected: $running"
+
+        local choice=''
+        while [ "$choice" != "y" ] && [ "$choice" != "n" ]
+        do
+            echo -e "\nWould you like this script to close them for you? ${INFO_COLOR}(y/n)${NO_COLOR}"
+            read -rp '> ' choice
+        done
+
+        if [ "$choice" == "y" ]
+        then
+            for binary in "${running_binaries[@]}"
+            do
+                graceful_kill "$binary"
+            done
+            print_info "Browsers closed."
+        else
+            print_info "Please close all browsers and restart this script."
+            exit "$E_BROWSER"
+        fi
+    fi
+} # check_running_browsers
 
 
 # Discovery of browsers installed on the user's system
-# Sets appropriate flags to control the flow of the installation, depending on
-# what is needed for the individual user
+# Iterates the BROWSERS registry, detects installed browsers, initializes
+# their profile directories, and handles Firefox snap on Debian.
 browser_check ()
 {
-    print_info "Checking for Firefox and Chrome..."
-    check_for_firefox
-    check_for_chrome
+    print_info "Checking for supported browsers..."
+    local pki_initialized=false
+    local ff_exists=false
 
-    # Browser check results
-    if [ "$ff_exists" == false ] && [ "$chrome_exists" == false ]
-    then
-        print_err "No version of Mozilla Firefox OR Google Chrome has been detected."
-        print_info "Please install either or both to proceed."
-        exit "$E_BROWSER"
-    elif [ "$ff_exists" == true ] # Firefox was found
-    then
-        if [ "$snap_ff" == true ] # Snap version of Firefox
+    for entry in "${BROWSERS[@]}"
+    do
+        IFS=':' read -r name binary db_pattern type <<< "$entry"
+
+        if ! command -v "$binary" >/dev/null 2>&1
         then
-            echo -e "
-            ********************${ERR_COLOR}[ WARNING ]${NO_COLOR}********************
-            * The version of Firefox you have installed       *
-            * currently was installed via snap.               *
-            * This version of Firefox is not currently        *
-            * compatible with the method used to enable CAC   *
-            * support in browsers.                            *
-            *                                                 *
-            * As a work-around, this script can automatically *
-            * remove the snap version and reinstall via apt.  *
-            *                                                 *
-            * The option to attempt to migrate all of your    *
-            * personalizations will be given if you choose to *
-            * replace Firefox via this script. Your Firefox   *
-            * profile will be saved to a temp location, then  *
-            * will overwrite the default profile once the apt *
-            * version of Firefox has been installed.          *
-            *                                                 *
-            ********************${ERR_COLOR}[ WARNING ]${NO_COLOR}********************\n"
+            continue
+        fi
 
-            # Prompt user to elect to replace snap firefox with apt firefox
-            choice=''
-            while [ "$choice" != "y" ] && [ "$choice" != "n" ]
-            do
-                echo -e "\nWould you like to switch to the apt version of Firefox? ${INFO_COLOR}(y/n)${NO_COLOR}"
-                read -rp '> ' choice
-            done
+        print_info "Found $name."
 
-            if [ "$choice" == "y" ]
+        # Firefox-specific: check for snap installation (Debian only)
+        if [ "$binary" == "firefox" ] && [ "$OS_FAMILY" == "debian" ]
+        then
+            local ff_path
+            ff_path="$(command -v firefox)"
+            if [[ "$ff_path" =~ snap ]]
             then
-                reconfigure_firefox
-            else
-                if [ "$chrome_exists" == false ]
-                then
-                    print_info "You have elected to keep the snap version of Firefox.\n"
-                    print_err "You have no compatible browsers. Exiting..."
-                    exit "$E_BROWSER"
-                fi
+                snap_ff=true
+                ff_exists=true
+                print_err "This version of Firefox was installed as a snap package"
+                continue
+            elif grep -Fq "exec /snap/bin/firefox" "$ff_path" 2>/dev/null
+            then
+                snap_ff=true
+                ff_exists=true
+                print_err "This version of Firefox was installed as a snap package with a launch script"
+                continue
+            fi
+        fi
+
+        # Track this browser as compatible
+        found_browsers+=("$name")
+        found_db_patterns+=("$db_pattern")
+
+        if [ "$binary" == "firefox" ]
+        then
+            ff_exists=true
+        fi
+
+        # Initialize profile directory via headless launch
+        if [ "$type" == "chromium" ]
+        then
+            # All Chromium-based browsers share ~/.pki/nssdb — only init once
+            if [ "$pki_initialized" == false ]
+            then
+                print_info "Running $name to generate certificate database..."
+                run_browser "$binary" "--headless --disable-gpu"
+                pki_initialized=true
+                print_info "Done."
+            fi
+        else
+            print_info "Running $name to generate profile directory..."
+            run_browser "$binary" "--headless --first-startup"
+            print_info "Done."
+        fi
+    done
+
+    # No browsers found at all
+    if [ "${#found_browsers[@]}" -eq 0 ] && [ "$snap_ff" == false ]
+    then
+        print_err "No supported browsers detected."
+        print_info "Please install a supported browser (Firefox, Chrome, Chromium, Brave, Edge, LibreWolf, Waterfox, or Vivaldi)."
+        exit "$E_BROWSER"
+    fi
+
+    # Handle snap Firefox on Debian
+    if [ "$snap_ff" == true ]
+    then
+        echo -e "
+        ********************${ERR_COLOR}[ WARNING ]${NO_COLOR}********************
+        * The version of Firefox you have installed       *
+        * currently was installed via snap.               *
+        * This version of Firefox is not currently        *
+        * compatible with the method used to enable CAC   *
+        * support in browsers.                            *
+        *                                                 *
+        * As a work-around, this script can automatically *
+        * remove the snap version and reinstall via apt.  *
+        *                                                 *
+        * The option to attempt to migrate all of your    *
+        * personalizations will be given if you choose to *
+        * replace Firefox via this script. Your Firefox   *
+        * profile will be saved to a temp location, then  *
+        * will overwrite the default profile once the apt *
+        * version of Firefox has been installed.          *
+        *                                                 *
+        ********************${ERR_COLOR}[ WARNING ]${NO_COLOR}********************\n"
+
+        # Prompt user to elect to replace snap firefox with apt firefox
+        choice=''
+        while [ "$choice" != "y" ] && [ "$choice" != "n" ]
+        do
+            echo -e "\nWould you like to switch to the apt version of Firefox? ${INFO_COLOR}(y/n)${NO_COLOR}"
+            read -rp '> ' choice
+        done
+
+        if [ "$choice" == "y" ]
+        then
+            reconfigure_firefox
+        else
+            if [ "${#found_browsers[@]}" -eq 0 ]
+            then
+                print_info "You have elected to keep the snap version of Firefox.\n"
+                print_err "You have no compatible browsers. Exiting..."
+                exit "$E_BROWSER"
             fi
         fi
     fi
@@ -345,16 +490,17 @@ migrate_ff_profile ()
 
     if [ "$direction" == "migrate" ]
     then
-        local apt_ff_profile
-        apt_ff_profile="$(find_db "firefox" | grep -v "snap")"
-        if [ -z "$apt_ff_profile" ]
+        # Find the apt Firefox profile directory. We search for the profile
+        # folder (*.default*) rather than cert9.db because the database may
+        # not exist yet after a fresh install and headless launch.
+        local apt_ff_profile_dir
+        apt_ff_profile_dir="$(find "$ORIG_HOME/.mozilla/firefox" -maxdepth 1 -type d -name "*.default*" 2>/dev/null | grep -v "snap" | head -n 1)"
+        if [ -z "$apt_ff_profile_dir" ]
         then
             print_err "Something went wrong while trying to find apt Firefox's user profile directory."
             exit "$E_DATABASE"
         else
-            local ff_profile_dir
-            ff_profile_dir="$(dirname "$apt_ff_profile")"
-            if sudo -H -u "$SUDO_USER" cp -rf "$DWNLD_DIR/$FF_PROFILE_NAME"/* "$ff_profile_dir"
+            if sudo -H -u "$SUDO_USER" cp -rf "$DWNLD_DIR/$FF_PROFILE_NAME"/* "$apt_ff_profile_dir"
             then
                 print_info "Successfully migrated user profile for Firefox versions"
             else
@@ -383,60 +529,6 @@ migrate_ff_profile ()
 } # migrate_ff_profile
 
 
-# Attempt to find an installed version of Firefox on the user's system
-# Determines whether the version is installed via snap or apt (Debian family only)
-check_for_firefox ()
-{
-    local ff_path
-    ff_path="$(command -v firefox)"
-    if [ -n "$ff_path" ]
-    then
-        ff_exists=true
-        print_info "Found Firefox."
-        if [ "$OS_FAMILY" == "debian" ]
-        then
-            if [[ "$ff_path" =~ snap ]]
-            then
-                snap_ff=true
-                print_err "This version of Firefox was installed as a snap package"
-            elif grep -Fq "exec /snap/bin/firefox" "$ff_path"
-            then
-                snap_ff=true
-                print_err "This version of Firefox was installed as a snap package with a launch script"
-            else
-                # Run Firefox to ensure .mozilla directory has been created
-                print_info "Running Firefox to generate profile directory..."
-                run_firefox
-                print_info "Done."
-            fi
-        else
-            # Run Firefox to ensure .mozilla directory has been created
-            print_info "Running Firefox to generate profile directory..."
-            run_firefox
-            print_info "Done."
-        fi
-    else
-        print_info "Firefox not found."
-    fi
-} # check_for_firefox
-
-
-# Attempt to find a version of Google Chrome installed on the user's system
-check_for_chrome ()
-{
-    # Check to see if Chrome exists
-    if command -v google-chrome >/dev/null
-    then
-        chrome_exists=true
-        print_info "Found Google Chrome."
-        # Run Chrome to ensure .pki directory has been created
-        run_chrome
-    else
-        print_info "Chrome not found."
-    fi
-} # check_for_chrome
-
-
 # Reinstall the user's previous version of Firefox if the snap version was
 # removed in the process of this script.
 revert_firefox ()
@@ -445,7 +537,7 @@ revert_firefox ()
     print_err "No valid databases located. Reinstalling previous version of Firefox..."
     DEBIAN_FRONTEND=noninteractive apt purge firefox -y
     snap install firefox
-    run_firefox
+    run_browser "firefox" "--headless --first-startup"
     print_info "Completed. Exiting..."
     # "Restore" the old profile back to the snap version of Firefox
     migrate_ff_profile "restore"
@@ -463,12 +555,19 @@ import_certs ()
     then
         case "$db_root" in
             *"pki"*)
-                print_info "Importing certificates for Chrome..."
-                echo
+                print_info "Importing certificates for Chromium-based browser..."
                 ;;
             *"firefox"*)
                 print_info "Importing certificates for Firefox..."
-                echo
+                ;;
+            *"librewolf"*)
+                print_info "Importing certificates for LibreWolf..."
+                ;;
+            *"waterfox"*)
+                print_info "Importing certificates for Waterfox..."
+                ;;
+            *)
+                print_info "Importing certificates..."
                 ;;
         esac
 

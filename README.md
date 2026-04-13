@@ -8,18 +8,19 @@
   <a href="https://github.com/jdjaxon/linux_cac/actions/workflows/CI.yml"><img alt="CI" src="https://github.com/jdjaxon/linux_cac/actions/workflows/CI.yml/badge.svg?" /></a>
 </p>
 
-A project for consistently configuring Debian-based Linux distributions to work with
-Common Access Cards (CACs). Currently, this process will not work with Firefox if it
-is installed via `snap`. Before using this project, please review the
+A project for configuring Linux distributions to work with Common Access Cards
+(CACs). Supports Debian/Ubuntu, Fedora/RHEL/CentOS, and Arch Linux. On
+Debian-family systems, the snap version of Firefox is not compatible with the
+certificate import method — the script can replace it with the apt version
+automatically. Before using this project, please review the
 [Known Issues](#known-issues) section.
 
 > [!note]
 > This project has moved from using Cackey to OpenSC, which seems to be
-> more stable. If you don't use Cackey as a dependency of anything else,
-> I recommend running the following:
-> ```
-> sudo apt purge cackey
-> ```
+> more stable. If you previously installed Cackey, you can remove it:
+> - Debian/Ubuntu: `sudo apt purge cackey`
+> - Fedora/RHEL: `sudo dnf remove cackey`
+> - Arch: `sudo pacman -R cackey`
 
 ## Table of Contents
 <details>
@@ -43,40 +44,44 @@ is installed via `snap`. Before using this project, please review the
 
 Regardless of how similar two distributions may be, I will only list
 distributions and versions here that I know have been tested with this method.
-Since Ubuntu 22.04, Firefox will only work if you allow the script to remove the
-`snap` version and reinstall the browser with `apt`.
+On Debian-family systems since Ubuntu 22.04, Firefox will only work if you
+allow the script to remove the `snap` version and reinstall the browser with
+`apt`.
 
-| Distribution | Versions  | Browsers                  |
-|    :-:       |    :-:    |       :-:                 |
-| Debian       | 12.5      | Firefox ESR, Chrome, Edge |
-| Mint         | 21.2      | Firefox, Chrome           |
-| Parrot OS    | 6.0.0-2   | Firefox, Brave            |
-| PopOS!       | 20.04 LTS | Firefox, Chrome           |
-|              | 22.04 LTS | Firefox, Chrome           |
-| Ubuntu       | 20.04 LTS | Firefox, Chrome           |
-|              | 22.04 LTS | Firefox, Chrome           |
+| Family | Distribution | Versions | Browsers |
+| :-: | :-: | :-: | :-: |
+| Debian | Debian | 12.5 | Firefox ESR, Chrome, Edge |
+| | Mint | 21.2 | Firefox, Chrome |
+| | Parrot OS | 6.0.0-2 | Firefox, Brave |
+| | PopOS! | 20.04 LTS, 22.04 LTS | Firefox, Chrome |
+| | Ubuntu | 20.04 LTS, 22.04 LTS | Firefox, Chrome |
+| Fedora | Fedora, RHEL, CentOS | — | Firefox, Chrome |
+| Arch | Arch Linux | — | Firefox, Chrome |
 
 > [!note]
-> There are reports of this script working with other distributions and
-> browsers. I have not personally tested these configurations.
+> Fedora/RHEL/CentOS and Arch Linux are supported via auto-detection but
+> have had limited community testing. There are also reports of this script
+> working with other distributions and browsers not listed above.
 
 
 ## Installation
 > [!warning]
 >  Please make sure all browsers are closed before running the script.
 
-This script requires root privileges since it installs `opensc` package and
+This script requires root privileges since it installs the `opensc` package and
 its dependencies. Feel free to review the script
 [here](https://raw.githubusercontent.com/jdjaxon/linux_cac/main/cac_setup.sh)
 if this makes you uncomfortable. For transparency, the
-the DoD certificates are downloaded from
+DoD certificates are downloaded from
 [here](https://militarycac.com/maccerts/AllCerts.zip), which are
 recommended by [militarycac](https://militarycac.com).
 
 > [!note]
 > - The automated installation requires `wget` and `unzip` to run and will
 >  install both during the setup if they are not already installed. If you don't
->  want either tool, remove it after the setup is complete using `sudo apt remove <command>`.
+>  want either tool, remove it after the setup is complete using your package
+>  manager (e.g., `sudo apt remove <command>`, `sudo dnf remove <command>`, or
+>  `sudo pacman -R <command>`).
 > - The scripted installation has only been tested on the configurations listed in the
 >  [Supported Configurations](#supported-configurations)
 
@@ -106,10 +111,6 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/jdjaxon/linux_cac/m
   from being able to read the certificates. One solution could be to uninstall
   Firefox from snap and reinstall it via `apt`. This current version of the
   script will attempt to do the reinstallation for you.
-
-- Recent DoD certificates do not work with Cackey and will cause errors like
-  `ERR_SSL_CLIENT_AUTH_NO_COMMON_ALGORITHMS`. You can simply rerun the script
-  to resolve this.
 
 - If you run into any issues with Firefox after running the script, clear your
   data and history in `Privacy & Security` and then restart Firefox. If your

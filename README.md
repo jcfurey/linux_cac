@@ -98,9 +98,10 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/jdjaxon/linux_cac/m
 ```
 
 ## Known Issues
-- The `pkcs11-register` command sometimes does not behave as expected when run
-  in a script. Users may need to reboot or run `pkcs11-register` upon the
-  completion of this setup script.
+- The CAC PKCS#11 module is loaded directly into each detected browser's NSS
+  database (both Firefox-family and Chromium-family). If a browser still does
+  not prompt for your PIN after setup, make sure it is fully closed (including
+  background processes) and reboot, then try again.
 
 - Firefox and Chrome both need to be started at least once to initialize their
   respective certificate databases/profiles.

@@ -24,6 +24,7 @@ DB_FILENAME="cert9.db"
 CERT_EXTENSION="cer"
 CERT_FILENAME="AllCerts"
 BUNDLE_FILENAME="AllCerts.zip"
+MODULE_NAME="CAC Module (OpenSC)" # NSS security-module display name for the OpenSC PKCS#11 library
 
 # Browser registry — each entry is "DisplayName:binary:db_pattern:type"
 #   db_pattern: grep pattern to match cert9.db paths for this browser
@@ -170,7 +171,32 @@ main ()
         fi
     done
 
-    register_pkcs11
+    # Load the OpenSC PKCS#11 module into every discovered database. This is the
+    # step that actually makes browsers prompt for the CAC PIN; importing
+    # certificates alone is not enough. Chromium-family browsers in particular
+    # are never handled by pkcs11-register, so without this they never prompt.
+    # Keying off each discovered cert9.db means both the classic (~/.pki/nssdb)
+    # and modern (~/.local/share/pki/nssdb) NSS locations are handled the same.
+    local opensc_module
+    opensc_module="$(find_opensc_module)"
+    if [ -z "$opensc_module" ]
+    then
+        print_err "Could not locate opensc-pkcs11.so; browsers will not prompt for the CAC PIN."
+        print_info "Ensure the 'opensc' package installed correctly, then re-run this script."
+    else
+        print_info "Loading OpenSC PKCS#11 module into browser databases..."
+        print_info "Using module: $opensc_module"
+        for db in "${databases[@]}"
+        do
+            if [ -n "$db" ]
+            then
+                load_pkcs11_module "$(dirname "$db")" "$opensc_module"
+            fi
+        done
+        print_info "Done"
+    fi
+
+    verify_pkcs11
 
     print_info "Enabling pcscd service to start on boot..."
     systemctl enable pcscd.socket
@@ -200,9 +226,10 @@ main ()
     print_info "Total certificates imported: $total_imported"
     echo
     print_info "Next steps:"
-    print_info "  1. Insert your CAC and restart your browser(s)."
-    print_info "  2. If a site does not prompt for your certificate, reboot."
-    print_info "  3. If issues persist, run 'pkcs11-register' and try again."
+    print_info "  1. Insert your CAC and fully restart your browser(s)."
+    print_info "  2. Visit a site that requires your certificate and enter your PIN when prompted."
+    print_info "  3. If no prompt appears, ensure the browser is fully closed (no background"
+    print_info "     processes), reboot, then try again."
 
     exit "$EXIT_SUCCESS"
 } # main
@@ -755,28 +782,89 @@ install_packages ()
 } # install_packages
 
 
-# Register the CAC PKCS11 module using the appropriate method for the OS family
-register_pkcs11 ()
+# Locate the OpenSC PKCS#11 shared object. Its path varies by distribution and
+# CPU architecture (Debian multiarch, Fedora lib64, Arch), so check the common
+# locations and fall back to a search. Prints the path on success.
+find_opensc_module ()
 {
-    case "$OS_FAMILY" in
-        debian)
-            print_info "Registering CAC module with PKCS11..."
-            pkcs11-register
-            print_info "Done"
-            ;;
-        fedora|arch)
-            print_info "Verifying PKCS11 module registration..."
-            # OpenSC module is automatically registered via p11-kit on Fedora and Arch
-            if p11-kit list-modules | grep -q opensc
-            then
-                print_info "OpenSC PKCS11 module is properly registered"
-            else
-                print_err "OpenSC PKCS11 module not found. You may need to reinstall opensc package."
-            fi
-            print_info "Done"
-            ;;
-    esac
-} # register_pkcs11
+    local arch_dir
+    arch_dir="$(uname -m)-linux-gnu"
+    local candidates=(
+        "/usr/lib/$arch_dir/opensc-pkcs11.so"
+        "/usr/lib/$arch_dir/pkcs11/opensc-pkcs11.so"
+        "/usr/lib64/opensc-pkcs11.so"
+        "/usr/lib64/pkcs11/opensc-pkcs11.so"
+        "/usr/lib/opensc-pkcs11.so"
+        "/usr/lib/pkcs11/opensc-pkcs11.so"
+    )
+
+    local candidate
+    for candidate in "${candidates[@]}"
+    do
+        if [ -e "$candidate" ]
+        then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    # Fall back to searching the common library roots
+    local found
+    found="$(find /usr/lib /usr/lib64 -name opensc-pkcs11.so 2>/dev/null | head -n 1)"
+    if [ -n "$found" ]
+    then
+        echo "$found"
+        return 0
+    fi
+
+    return 1
+} # find_opensc_module
+
+
+# Load the OpenSC PKCS#11 module into a single NSS database so the owning
+# browser will prompt for the CAC PIN. Idempotent: skips databases that already
+# have the module. Runs as the invoking user so NSS files stay user-owned.
+load_pkcs11_module ()
+{
+    local db_root="$1"
+    local module="$2"
+
+    if sudo -H -u "$SUDO_USER" modutil -dbdir sql:"$db_root" -list 2>/dev/null | grep -qF "$MODULE_NAME"
+    then
+        print_info "Module already present in $db_root"
+        return 0
+    fi
+
+    # -force suppresses modutil's interactive confirmation prompt
+    if sudo -H -u "$SUDO_USER" modutil -dbdir sql:"$db_root" -add "$MODULE_NAME" -libfile "$module" -force >/dev/null 2>&1
+    then
+        print_info "Loaded module into $db_root"
+    else
+        print_err "Failed to load module into $db_root"
+    fi
+} # load_pkcs11_module
+
+
+# Sanity-check that the OpenSC PKCS#11 module is visible to p11-kit. The module
+# is loaded directly into each browser database by load_pkcs11_module; this is
+# an informational check and also covers system-wide NSS consumers on
+# Fedora/Arch, where p11-kit auto-loads the module.
+verify_pkcs11 ()
+{
+    if ! command -v p11-kit >/dev/null 2>&1
+    then
+        return 0
+    fi
+
+    print_info "Verifying OpenSC PKCS#11 module registration..."
+    if p11-kit list-modules 2>/dev/null | grep -qi opensc
+    then
+        print_info "OpenSC PKCS#11 module is registered with p11-kit."
+    else
+        print_err "OpenSC PKCS#11 module not visible to p11-kit. If browsers do not prompt for your PIN, reinstall the 'opensc' package."
+    fi
+    print_info "Done"
+} # verify_pkcs11
 
 
 main

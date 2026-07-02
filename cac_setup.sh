@@ -3,6 +3,10 @@
 # cac_setup.sh
 # Description: Setup a Linux environment for Common Access Card use.
 
+# Ensure globs that match nothing expand to nothing (not the literal pattern),
+# so an empty certificate directory can't produce a bogus "*.cer" import.
+shopt -s nullglob
+
 # Constants
 EXIT_SUCCESS=0                      # Success exit code
 E_NOTROOT=86                        # Non-root exit error
@@ -45,8 +49,9 @@ main ()
     ff_was_pinned=false                 # Whether Firefox was pinned in GNOME favorites
     OS_FAMILY=""                        # Detected OS family (debian/fedora/arch)
 
-    ORIG_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    ORIG_HOME=""                        # Home dir of the invoking user (set by user_check)
     CERT_URL="https://militarycac.com/maccerts/$BUNDLE_FILENAME"
+    total_imported=0                    # Running count of certificates imported
 
     # Arrays populated by browser_check
     found_db_patterns=()                # Database grep patterns for detected browsers
@@ -54,6 +59,7 @@ main ()
 
     detect_os
     root_check
+    user_check
     check_running_browsers
     browser_check
 
@@ -75,12 +81,24 @@ main ()
     done
 
     # Exclude snap paths only on Debian-family systems
+    local db_exclude=""
     if [ "$OS_FAMILY" == "debian" ]
     then
-        mapfile -t databases < <(find_db "$db_pattern" "snap")
-    else
-        mapfile -t databases < <(find_db "$db_pattern")
+        db_exclude="snap"
     fi
+
+    # Browser profile/database creation can lag behind the headless launch, so
+    # retry the search a few times before giving up. This is the most common
+    # cause of the "No valid databases located" failure.
+    local db_tries=3
+    mapfile -t databases < <(find_db "$db_pattern" "$db_exclude")
+    while [ "${#databases[@]}" -eq 0 ] && [ "$db_tries" -gt 1 ]
+    do
+        print_info "No certificate databases found yet; waiting for browser profiles to initialize..."
+        sleep 3
+        mapfile -t databases < <(find_db "$db_pattern" "$db_exclude")
+        db_tries=$((db_tries - 1))
+    done
 
     # Check if databases were found properly
     if [ "${#databases[@]}" -eq 0 ]
@@ -105,7 +123,11 @@ main ()
 
     # Install middleware and necessary utilities
     print_info "Installing middleware and essential utilities..."
-    install_packages
+    if ! install_packages
+    then
+        print_err "Failed to install required packages. Check your network and package manager, then re-run."
+        exit 1
+    fi
     print_info "Done"
 
     # Pull all necessary files
@@ -118,10 +140,25 @@ main ()
     print_info "Done."
 
     # Unzip cert bundle
-    if [ -e "$DWNLD_DIR/$BUNDLE_FILENAME" ]
+    if [ ! -e "$DWNLD_DIR/$BUNDLE_FILENAME" ]
     then
-        mkdir -p "$DWNLD_DIR/$CERT_FILENAME"
-        unzip -qo "$DWNLD_DIR/$BUNDLE_FILENAME" -d "$DWNLD_DIR/$CERT_FILENAME"
+        print_err "Certificate bundle not found at $DWNLD_DIR/$BUNDLE_FILENAME"
+        exit "$E_DATABASE"
+    fi
+    mkdir -p "$DWNLD_DIR/$CERT_FILENAME"
+    if ! unzip -qo "$DWNLD_DIR/$BUNDLE_FILENAME" -d "$DWNLD_DIR/$CERT_FILENAME"
+    then
+        print_err "Failed to extract certificate bundle. The download may be corrupt."
+        exit "$E_DATABASE"
+    fi
+
+    # Ensure at least one certificate was actually extracted before importing
+    local -a cert_files
+    cert_files=("$DWNLD_DIR/$CERT_FILENAME"/*."$CERT_EXTENSION")
+    if [ "${#cert_files[@]}" -eq 0 ]
+    then
+        print_err "No certificates (*.$CERT_EXTENSION) found in the downloaded bundle. Aborting."
+        exit "$E_DATABASE"
     fi
 
     # Import certificates into cert9.db databases for browsers
@@ -149,8 +186,23 @@ main ()
     then
         print_err "Failed to remove artifacts. Artifacts were stored in ${DWNLD_DIR}."
     else
-        print_info "Done. A reboot may be required."
+        print_info "Done."
     fi
+
+    # Summary of what was accomplished
+    echo
+    print_info "===================== Setup complete ====================="
+    if [ "${#found_browsers[@]}" -gt 0 ]
+    then
+        print_info "Configured browser(s): ${found_browsers[*]}"
+    fi
+    print_info "Certificate databases updated: ${#databases[@]}"
+    print_info "Total certificates imported: $total_imported"
+    echo
+    print_info "Next steps:"
+    print_info "  1. Insert your CAC and restart your browser(s)."
+    print_info "  2. If a site does not prompt for your certificate, reboot."
+    print_info "  3. If issues persist, run 'pkcs11-register' and try again."
 
     exit "$EXIT_SUCCESS"
 } # main
@@ -191,15 +243,19 @@ run_browser ()
 } # run_browser
 
 
-# Gracefully terminate a process, falling back to SIGKILL
+# Gracefully terminate a process, falling back to SIGKILL.
+# Matches against the full command line (-f) to stay consistent with how
+# browsers are detected. This matters for binaries whose names exceed the
+# 15-char kernel "comm" limit (e.g. chromium-browser, microsoft-edge-stable),
+# which plain pkill would silently fail to match.
 graceful_kill ()
 {
     local process_name="$1"
-    pkill "$process_name" 2>/dev/null
+    pkill -f "$process_name" 2>/dev/null
     sleep 2
-    if pgrep "$process_name" >/dev/null 2>&1
+    if pgrep -f "$process_name" >/dev/null 2>&1
     then
-        pkill -9 "$process_name" 2>/dev/null
+        pkill -9 -f "$process_name" 2>/dev/null
     fi
     sleep 1
 } # graceful_kill
@@ -232,6 +288,28 @@ root_check ()
         exit "$E_NOTROOT"
     fi
 } # root_check
+
+
+# Ensure the script was launched via sudo by a regular user, and resolve that
+# user's home directory. The script drops to $SUDO_USER to launch browsers and
+# searches that user's home for certificate databases, so a missing SUDO_USER
+# (e.g. running from a raw root shell) would otherwise fail in confusing ways.
+user_check ()
+{
+    if [ -z "${SUDO_USER:-}" ] || [ "$SUDO_USER" == "root" ]
+    then
+        print_err "This script must be run with sudo as your regular user, not from a root shell."
+        print_info "Example: sudo bash cac_setup.sh"
+        exit "$E_NOTROOT"
+    fi
+
+    ORIG_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    if [ -z "$ORIG_HOME" ] || [ ! -d "$ORIG_HOME" ]
+    then
+        print_err "Could not determine a valid home directory for user '$SUDO_USER'."
+        exit "$E_NOTROOT"
+    fi
+} # user_check
 
 
 # Replace the current snap version of Firefox with the compatible apt version of Firefox
@@ -337,7 +415,6 @@ browser_check ()
 {
     print_info "Checking for supported browsers..."
     local pki_initialized=false
-    local ff_exists=false
 
     for entry in "${BROWSERS[@]}"
     do
@@ -358,13 +435,11 @@ browser_check ()
             if [[ "$ff_path" =~ snap ]]
             then
                 snap_ff=true
-                ff_exists=true
                 print_err "This version of Firefox was installed as a snap package"
                 continue
             elif grep -Fq "exec /snap/bin/firefox" "$ff_path" 2>/dev/null
             then
                 snap_ff=true
-                ff_exists=true
                 print_err "This version of Firefox was installed as a snap package with a launch script"
                 continue
             fi
@@ -373,11 +448,6 @@ browser_check ()
         # Track this browser as compatible
         found_browsers+=("$name")
         found_db_patterns+=("$db_pattern")
-
-        if [ "$binary" == "firefox" ]
-        then
-            ff_exists=true
-        fi
 
         # Initialize profile directory via headless launch
         if [ "$type" == "chromium" ]
@@ -549,7 +619,8 @@ revert_firefox ()
 # Integrate all certificates into the databases for existing browsers
 import_certs ()
 {
-    db=$1
+    local db="$1"
+    local db_root cert imported=0 failed=0
     db_root="$(dirname "$db")"
     if [ -n "$db_root" ]
     then
@@ -571,17 +642,26 @@ import_certs ()
                 ;;
         esac
 
-        print_info "Loading certificates into $db_root "
-        echo
+        print_info "Loading certificates into $db_root"
 
         for cert in "$DWNLD_DIR/$CERT_FILENAME/"*."$CERT_EXTENSION"
         do
-            echo "Importing $cert"
-            certutil -d sql:"$db_root" -A -t TC -n "$cert" -i "$cert"
+            if certutil -d sql:"$db_root" -A -t TC -n "$cert" -i "$cert" 2>/dev/null
+            then
+                imported=$((imported + 1))
+            else
+                failed=$((failed + 1))
+            fi
         done
-    fi
 
-    print_info "Done."
+        if [ "$failed" -gt 0 ]
+        then
+            print_err "Imported $imported certificate(s), $failed failed for $db_root"
+        else
+            print_info "Imported $imported certificate(s)."
+        fi
+        total_imported=$((total_imported + imported))
+    fi
     echo
 } # import_certs
 
@@ -662,14 +742,14 @@ install_packages ()
 {
     case "$OS_FAMILY" in
         debian)
-            apt update
-            DEBIAN_FRONTEND=noninteractive apt install -y libpcsclite1 pcscd libccid libpcsc-perl pcsc-tools libnss3-tools unzip wget opensc
+            apt update || print_err "apt update reported errors; attempting to continue..."
+            DEBIAN_FRONTEND=noninteractive apt install -y libpcsclite1 pcscd libccid libpcsc-perl pcsc-tools libnss3-tools unzip wget opensc || return 1
             ;;
         fedora)
-            dnf install -y pcsc-lite pcsc-lite-ccid opensc nss-tools unzip wget pcsc-tools
+            dnf install -y pcsc-lite pcsc-lite-ccid opensc nss-tools unzip wget pcsc-tools || return 1
             ;;
         arch)
-            pacman -Sy --noconfirm pcsclite ccid opensc nss unzip wget pcsc-tools
+            pacman -Sy --noconfirm pcsclite ccid opensc nss unzip wget pcsc-tools || return 1
             ;;
     esac
 } # install_packages

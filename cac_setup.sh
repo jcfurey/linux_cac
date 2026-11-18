@@ -13,7 +13,6 @@ E_NOTROOT=86                        # Non-root exit error
 E_BROWSER=87                        # Compatible browser not found
 E_DATABASE=88                       # No database located
 E_DISTRO=89                         # Unsupported Linux distribution
-DWNLD_DIR="/tmp"                    # Location to place artifacts
 FF_PROFILE_NAME="old_ff_profile"    # Location to save old Firefox profile
 
 ERR_COLOR='\033[0;31m'              # Red for error messages
@@ -26,21 +25,18 @@ CERT_FILENAME="AllCerts"
 BUNDLE_FILENAME="AllCerts.zip"
 MODULE_NAME="CAC Module (OpenSC)" # NSS security-module display name for the OpenSC PKCS#11 library
 
-# Browser registry — each entry is "DisplayName:binary:db_pattern:type"
-#   db_pattern: grep pattern to match cert9.db paths for this browser
-#   type: "firefox" (Firefox-family) or "chromium" (Chromium-family)
-# To add a new browser, add an entry here. Chromium-based browsers all share
-# the ~/.pki/nssdb/ database, so only one needs to run to initialize it.
+# Display name, executable and browser family.
 BROWSERS=(
-    "Firefox:firefox:firefox:firefox"
-    "LibreWolf:librewolf:librewolf:firefox"
-    "Waterfox:waterfox:waterfox:firefox"
-    "Google Chrome:google-chrome:pki:chromium"
-    "Chromium:chromium-browser:pki:chromium"
-    "Chromium:chromium:pki:chromium"
-    "Brave:brave-browser:pki:chromium"
-    "Microsoft Edge:microsoft-edge-stable:pki:chromium"
-    "Vivaldi:vivaldi-stable:pki:chromium"
+    "Firefox:firefox:firefox"
+    "Firefox ESR:firefox-esr:firefox"
+    "LibreWolf:librewolf:firefox"
+    "Waterfox:waterfox:firefox"
+    "Google Chrome:google-chrome:chromium"
+    "Chromium:chromium-browser:chromium"
+    "Chromium:chromium:chromium"
+    "Brave:brave-browser:chromium"
+    "Microsoft Edge:microsoft-edge-stable:chromium"
+    "Vivaldi:vivaldi-stable:chromium"
 )
 
 main ()
@@ -54,9 +50,9 @@ main ()
     CERT_URL="https://militarycac.com/maccerts/$BUNDLE_FILENAME"
     total_imported=0                    # Running count of certificates imported
 
-    # Arrays populated by browser_check
-    found_db_patterns=()                # Database grep patterns for detected browsers
-    found_browsers=()                   # Display names of detected compatible browsers
+    local -a selected_browsers=()
+    found_browsers=()
+    databases=()
 
     detect_os
     root_check
@@ -64,90 +60,41 @@ main ()
     check_running_browsers
     browser_check
 
-    # Build deduplicated grep pattern from detected browsers
-    local db_pattern=""
-    local -A seen_patterns
-    for p in "${found_db_patterns[@]}"
-    do
-        if [ -z "${seen_patterns[$p]:-}" ]
-        then
-            seen_patterns[$p]=1
-            if [ -n "$db_pattern" ]
-            then
-                db_pattern="$db_pattern\|$p"
-            else
-                db_pattern="$p"
-            fi
-        fi
-    done
-
-    # Exclude snap paths only on Debian-family systems
-    local db_exclude=""
-    if [ "$OS_FAMILY" == "debian" ]
-    then
-        db_exclude="snap"
-    fi
-
-    # Browser profile/database creation can lag behind the headless launch, so
-    # retry the search a few times before giving up. This is the most common
-    # cause of the "No valid databases located" failure.
-    local db_tries=3
-    mapfile -t databases < <(find_db "$db_pattern" "$db_exclude")
-    while [ "${#databases[@]}" -eq 0 ] && [ "$db_tries" -gt 1 ]
-    do
-        print_info "No certificate databases found yet; waiting for browser profiles to initialize..."
-        sleep 3
-        mapfile -t databases < <(find_db "$db_pattern" "$db_exclude")
-        db_tries=$((db_tries - 1))
-    done
-
-    # Check if databases were found properly
-    if [ "${#databases[@]}" -eq 0 ]
-    then
-        # Database was not found
-        if [ "$snap_ff" == true ]
-        then
-            revert_firefox
-        else
-            # Firefox was not replaced, exit with E_DATABASE error
-            print_err "No valid databases located. Try running, then closing your browser(s), then start this script again."
-            echo -e "\tExiting..."
-
-            exit "$E_DATABASE"
-        fi
-    else
-        # Database was found. (Good)
-        # If Firefox was replaced from snap to apt, the snap_ff flag is no longer
-        # relevant since we now have a valid database from the apt version.
-        snap_ff=false
-    fi
-
-    # Install middleware and necessary utilities
     print_info "Installing middleware and essential utilities..."
     if ! install_packages
     then
         print_err "Failed to install required packages. Check your network and package manager, then re-run."
         exit 1
     fi
-    print_info "Done"
+
+    # Keep downloads and any migration backup private to this run and user.
+    DWNLD_DIR="$(as_user mktemp -d /tmp/linux-cac.XXXXXXXX)" || exit 1
+    trap 'cleanup "$?"' EXIT
+    init_browser_dbs
+
+    if [ "${#databases[@]}" -eq 0 ]
+    then
+        print_err "No browser certificate databases found. Start and close the browser, then rerun setup."
+        exit "$E_DATABASE"
+    fi
+
+    local opensc_module
+    if ! opensc_module="$(find_opensc_module)"
+    then
+        print_err "Could not locate opensc-pkcs11.so. Check the OpenSC package installation."
+        exit "$E_DATABASE"
+    fi
 
     # Pull all necessary files
     print_info "Downloading DoD certificates..."
-    if ! wget -qP "$DWNLD_DIR" "$CERT_URL"
+    if ! as_user wget -qO "$DWNLD_DIR/$BUNDLE_FILENAME" "$CERT_URL"
     then
         print_err "Failed to download DoD certificates from $CERT_URL"
         exit 1
     fi
     print_info "Done."
 
-    # Unzip cert bundle
-    if [ ! -e "$DWNLD_DIR/$BUNDLE_FILENAME" ]
-    then
-        print_err "Certificate bundle not found at $DWNLD_DIR/$BUNDLE_FILENAME"
-        exit "$E_DATABASE"
-    fi
-    mkdir -p "$DWNLD_DIR/$CERT_FILENAME"
-    if ! unzip -qo "$DWNLD_DIR/$BUNDLE_FILENAME" -d "$DWNLD_DIR/$CERT_FILENAME"
+    if ! as_user unzip -qo "$DWNLD_DIR/$BUNDLE_FILENAME" -d "$DWNLD_DIR/$CERT_FILENAME"
     then
         print_err "Failed to extract certificate bundle. The download may be corrupt."
         exit "$E_DATABASE"
@@ -162,66 +109,30 @@ main ()
         exit "$E_DATABASE"
     fi
 
-    # Import certificates into cert9.db databases for browsers
+    local db failed=0
     for db in "${databases[@]}"
     do
-        if [ -n "$db" ]
-        then
-            import_certs "$db"
-        fi
+        import_certs "$db" || failed=1
+        load_pkcs11_module "$db" "$opensc_module" || failed=1
     done
 
-    # Load the OpenSC PKCS#11 module into every discovered database. This is the
-    # step that actually makes browsers prompt for the CAC PIN; importing
-    # certificates alone is not enough. Chromium-family browsers in particular
-    # are never handled by pkcs11-register, so without this they never prompt.
-    # Keying off each discovered cert9.db means both the classic (~/.pki/nssdb)
-    # and modern (~/.local/share/pki/nssdb) NSS locations are handled the same.
-    local opensc_module
-    opensc_module="$(find_opensc_module)"
-    if [ -z "$opensc_module" ]
+    if [ "$failed" -ne 0 ]
     then
-        print_err "Could not locate opensc-pkcs11.so; browsers will not prompt for the CAC PIN."
-        print_info "Ensure the 'opensc' package installed correctly, then re-run this script."
-    else
-        print_info "Loading OpenSC PKCS#11 module into browser databases..."
-        print_info "Using module: $opensc_module"
-        for db in "${databases[@]}"
-        do
-            if [ -n "$db" ]
-            then
-                load_pkcs11_module "$(dirname "$db")" "$opensc_module"
-            fi
-        done
-        print_info "Done"
+        print_err "Browser configuration was incomplete. See the database errors above and rerun setup."
+        exit "$E_DATABASE"
     fi
 
     verify_pkcs11
-
-    print_info "Enabling pcscd service to start on boot..."
-    systemctl enable pcscd.socket
-    if [ "$OS_FAMILY" != "debian" ]
+    if ! systemctl enable --now pcscd.socket
     then
-        systemctl start pcscd.socket
-    fi
-    print_info "Done"
-
-    # Remove artifacts
-    print_info "Removing artifacts..."
-    if ! rm -rf "${DWNLD_DIR:?}"/{"$BUNDLE_FILENAME","$CERT_FILENAME","$FF_PROFILE_NAME"} 2>/dev/null
-    then
-        print_err "Failed to remove artifacts. Artifacts were stored in ${DWNLD_DIR}."
-    else
-        print_info "Done."
+        print_err "Could not enable and start pcscd.socket."
+        exit 1
     fi
 
     # Summary of what was accomplished
     echo
     print_info "===================== Setup complete ====================="
-    if [ "${#found_browsers[@]}" -gt 0 ]
-    then
-        print_info "Configured browser(s): ${found_browsers[*]}"
-    fi
+    print_info "Configured browser(s): ${found_browsers[*]}"
     print_info "Certificate databases updated: ${#databases[@]}"
     print_info "Total certificates imported: $total_imported"
     echo
@@ -235,70 +146,135 @@ main ()
 } # main
 
 
-# Find cert9.db databases, excluding Trash directories
-# Usage: find_db [include_filter] [exclude_filter]
-find_db ()
+as_user ()
 {
-    local include="${1:-}"
-    local exclude="${2:-}"
-    local results
-    results=$(find "$ORIG_HOME" -name "$DB_FILENAME" 2>/dev/null | grep -v "Trash")
+    sudo -H -u "$SUDO_USER" -- "$@"
+}
 
-    if [ -n "$include" ]
-    then
-        results=$(echo "$results" | grep "$include")
-    fi
-    if [ -n "$exclude" ]
-    then
-        results=$(echo "$results" | grep -v "$exclude")
-    fi
-    echo "$results"
-} # find_db
-
-
-# Run a browser headlessly to initialize its profile/database directory
-# Usage: run_browser <binary> <headless_args>
-run_browser ()
+cleanup ()
 {
-    local binary="$1"
-    local args="$2"
-    print_info "Starting $binary silently to complete post-install actions..."
-    # shellcheck disable=SC2086
-    sudo -H -u "$SUDO_USER" "$binary" $args >/dev/null 2>&1 &
-    sleep 3
-    graceful_kill "$binary"
-} # run_browser
-
-
-# Gracefully terminate a process, falling back to SIGKILL.
-# Matches against the full command line (-f) to stay consistent with how
-# browsers are detected. This matters for binaries whose names exceed the
-# 15-char kernel "comm" limit (e.g. chromium-browser, microsoft-edge-stable),
-# which plain pkill would silently fail to match.
-graceful_kill ()
-{
-    local process_name="$1"
-    pkill -f "$process_name" 2>/dev/null
-    sleep 2
-    if pgrep -f "$process_name" >/dev/null 2>&1
+    if [ "$1" -ne 0 ] && [ "$backup_exists" == true ]
     then
-        pkill -9 -f "$process_name" 2>/dev/null
+        print_err "Firefox profile backup retained in $DWNLD_DIR/$FF_PROFILE_NAME"
+    else
+        as_user rm -rf -- "${DWNLD_DIR:?}" || print_err "Could not clean up $DWNLD_DIR"
     fi
-    sleep 1
-} # graceful_kill
+}
 
+# Keep one entry per NSS directory, including when browser commands are aliases.
+init_nss_db ()
+{
+    local dir="$1" db
+    for db in "${databases[@]}"
+    do
+        [[ "$db" -ef "$dir" ]] && return 0
+    done
+    if [ ! -f "$dir/$DB_FILENAME" ]
+    then
+        if ! as_user mkdir -p -- "$dir" || ! as_user certutil -N -d "sql:$dir" --empty-password
+        then
+            print_err "Could not initialize the NSS database in $dir"
+            return 1
+        fi
+    fi
+    databases+=("$dir")
+}
+
+# Read profile paths ([ProfileN] Path) or install defaults ([Install...] Default)
+# from Firefox's registry, including profiles stored outside the browser root.
+firefox_profiles ()
+{
+    local -n result="$1"
+    local key="$2" root profile paths
+    shift 2
+    result=()
+    for root in "$@"
+    do
+        if [ -f "$root/profiles.ini" ]
+        then
+            # shellcheck disable=SC2016
+            paths="$(as_user awk -v key="$key" '
+                { sub(/\r$/, "") }
+                /^\[/ { selected = (key == "Path" ? /^\[Profile[0-9]+\]$/ : /^\[Install[^]]+\]$/) }
+                selected && index($0, key "=") == 1 { print substr($0, length(key) + 2) }
+            ' "$root/profiles.ini")" || return 1
+            while IFS= read -r profile
+            do
+                [ -n "$profile" ] || continue
+                [[ "$profile" = /* ]] || profile="$root/$profile"
+                [ -d "$profile" ] && result+=("$profile")
+            done <<< "$paths"
+        elif [ "$key" == Path ]
+        then
+            for profile in "$root"/*/"$DB_FILENAME"
+            do
+                result+=("${profile%/*}")
+            done
+        fi
+    done
+    return 0
+}
+
+init_browser_profile_dbs ()
+{
+    local binary="$1" profile
+    local -a roots profiles
+    case "$binary" in
+        firefox|firefox-esr) roots=("$ORIG_HOME/.mozilla/firefox" "$ORIG_HOME/.config/mozilla/firefox") ;;
+        librewolf) roots=("$ORIG_HOME/.librewolf" "$ORIG_HOME/.config/librewolf") ;;
+        waterfox)  roots=("$ORIG_HOME/.waterfox" "$ORIG_HOME/.config/waterfox") ;;
+    esac
+
+    firefox_profiles profiles Path "${roots[@]}" || return 1
+    if [ "${#profiles[@]}" -eq 0 ]
+    then
+        # Let the browser select its default profile and exit on its own.
+        # -CreateProfile alone can leave a named profile unused on first launch.
+        print_info "Initializing the default $binary profile..."
+        if ! as_user timeout -k 5 60 "$binary" --headless --no-remote --screenshot /dev/null about:blank >/dev/null
+        then
+            print_err "Could not initialize $binary. Start and close it, then rerun setup."
+            return 1
+        fi
+        firefox_profiles profiles Path "${roots[@]}" || return 1
+    fi
+    if [ "${#profiles[@]}" -eq 0 ]
+    then
+        print_err "Could not locate a $binary profile. Start and close the browser, then rerun setup."
+        return 1
+    fi
+    for profile in "${profiles[@]}"
+    do
+        init_nss_db "$profile" || return 1
+    done
+}
+
+init_chromium_dbs ()
+{
+    local legacy="$ORIG_HOME/.pki/nssdb" modern="$ORIG_HOME/.local/share/pki/nssdb"
+    # Older releases require the legacy path. Newer releases also honor it,
+    # but creating it alongside an existing modern database can mask that DB.
+    if [ -d "$legacy" ] || [ ! -d "$modern" ]
+    then
+        init_nss_db "$legacy" || return 1
+    fi
+    if [ -d "$modern" ]
+    then
+        init_nss_db "$modern" || return 1
+    fi
+}
 
 # Prints message with red [ERROR] tag before the message
 print_err ()
 {
-    echo -e "${ERR_COLOR}[ERROR]${NO_COLOR} $1"
+    printf '%b[ERROR]%b %s\n' "$ERR_COLOR" "$NO_COLOR" "$1" >&2
 } # print_err
 
 
 # Prints message with yellow [INFO] tag before the message
 print_info ()
 {
-    echo -e "${INFO_COLOR}[INFO]${NO_COLOR} $1"
+    printf '%b[INFO]%b %s\n' "$INFO_COLOR" "$NO_COLOR" "$1"
 } # print_info
 
 
@@ -339,394 +315,259 @@ user_check ()
 } # user_check
 
 
-# Replace the current snap version of Firefox with the compatible apt version of Firefox
+is_snap_firefox ()
+{
+    local launcher
+    launcher="$(command -v firefox)" || return 1
+    [[ "$launcher" == */snap/bin/firefox ]] || grep -Fq 'exec /snap/bin/firefox' "$launcher"
+}
+
+ask_yes_no ()
+{
+    local choice
+    while true
+    do
+        if ! read -rp "$1 (y/n) " choice
+        then
+            print_err "Setup requires an answer. Rerun it in an interactive terminal."
+            exit "$E_BROWSER"
+        fi
+        case "$choice" in
+            y|Y) return 0 ;;
+            n|N) return 1 ;;
+        esac
+    done
+}
+
+install_native_firefox ()
+{
+    print_info "Installing native Firefox from the Mozilla Team PPA..."
+    add-apt-repository -y ppa:mozillateam/ppa || return 1
+    printf '%s\n' 'Package: firefox*' 'Pin: release o=LP-PPA-mozillateam' 'Pin-Priority: 1001' \
+        > /etc/apt/preferences.d/mozilla-firefox || return 1
+    # shellcheck disable=SC2016
+    echo 'Unattended-Upgrade::Allowed-Origins:: "LP-PPA-mozillateam:${distro_codename}";' \
+        > /etc/apt/apt.conf.d/51unattended-upgrades-firefox || return 1
+    DEBIAN_FRONTEND=noninteractive apt install -y --allow-downgrades firefox || return 1
+    hash -r
+    if ! command -v firefox >/dev/null || is_snap_firefox
+    then
+        print_err "Could not find a native Firefox installation. Keeping the snap."
+        return 1
+    fi
+}
+
+
+# Finish configuring the native browser before removing the user's snap.
 reconfigure_firefox ()
 {
-    # Replace snap Firefox with version from PPA maintained via Mozilla
+    local -a profiles
+    local snap_home="$ORIG_HOME/snap/firefox/common"
+    local -a native_roots=("$ORIG_HOME/.mozilla/firefox" "$ORIG_HOME/.config/mozilla/firefox")
     check_for_ff_pin
-    #Profile migration
-    backup_ff_profile
-    print_info "Removing Snap version of Firefox"
-    snap remove --purge firefox
-    print_info "Adding PPA for Mozilla maintained Firefox"
-    add-apt-repository -y ppa:mozillateam/ppa
-    print_info "Setting priority to prefer Mozilla PPA over snap package"
-    echo -e "Package: *\nPin: release o=LP-PPA-mozillateam\nPin-Priority: 1001" > /etc/apt/preferences.d/mozilla-firefox
-    print_info "Enabling updates for future Firefox releases"
-    # shellcheck disable=SC2016
-    echo -e 'Unattended-Upgrade::Allowed-Origins:: "LP-PPA-mozillateam:${distro_codename}";' > /etc/apt/apt.conf.d/51unattended-upgrades-firefox
-    print_info "Installing Firefox via apt"
-    DEBIAN_FRONTEND=noninteractive apt install -y --allow-downgrades firefox
-    print_info "Completed re-installation of Firefox"
-
-    # Forget the previous location of firefox executable
-    if hash firefox
+    firefox_profiles profiles Path "$snap_home/.mozilla/firefox" "$snap_home/.config/mozilla/firefox" || return 1
+    if [ "${#profiles[@]}" -gt 0 ] && ask_yes_no "Copy your snap profile over the native default Firefox profile, including bookmarks and saved logins?"
     then
-        hash -d firefox
+        if [ "${#profiles[@]}" -ne 1 ]
+        then
+            print_err "Several snap profiles exist. Migrate them manually before replacing Firefox."
+            return 1
+        fi
+        as_user mkdir -- "$DWNLD_DIR/$FF_PROFILE_NAME" || return 1
+        as_user cp -a -- "${profiles[0]}/." "$DWNLD_DIR/$FF_PROFILE_NAME/" || return 1
+        backup_exists=true
     fi
 
-    run_browser "firefox" "--headless --first-startup"
-    print_info "Finished, closing Firefox."
+    install_native_firefox || return 1
+    init_browser_profile_dbs firefox || return 1
 
     if [ "$backup_exists" == true ]
     then
-        print_info "Migrating user profile into newly installed Firefox"
-        migrate_ff_profile "migrate"
+        firefox_profiles profiles Path "${native_roots[@]}" || return 1
+        if [ "${#profiles[@]}" -gt 1 ]
+        then
+            firefox_profiles profiles Default "${native_roots[@]}" || return 1
+        fi
+        if [ "${#profiles[@]}" -ne 1 ]
+        then
+            print_err "Cannot select a single native Firefox profile for migration. Keeping the snap."
+            return 1
+        fi
+        as_user cp -a -- "$DWNLD_DIR/$FF_PROFILE_NAME/." "${profiles[0]}/" || return 1
     fi
-
+    snap remove firefox || return 1
     repin_firefox
-} # reconfigure_firefox
+}
 
+# Match the invoking user's browser executable, including its packaged name.
+# A browser name in a document path or another process's arguments is unrelated.
+browser_process_pattern ()
+{
+    local names="$1"
+    case "$1" in
+        google-chrome) names='google-chrome(-stable)?|chrome' ;;
+        chromium-browser|chromium) names='chromium(-browser)?' ;;
+        microsoft-edge-stable) names='microsoft-edge(-stable)?|msedge' ;;
+        brave-browser) names='brave(-browser)?' ;;
+        vivaldi-stable) names='vivaldi(-stable|-bin)?' ;;
+        firefox|firefox-esr) names='firefox(-esr|-bin)?' ;;
+    esac
+    printf '^([^[:space:]]*/)?(%s)([[:space:]]|$)' "$names"
+}
 
-# Check if any supported browsers are currently running and warn the user.
-# Offers to kill them since the script runs as root.
 check_running_browsers ()
 {
-    local running=""
-    local -a running_binaries=()
-    local -A checked
-
+    local entry name binary pattern
+    local -a running=() patterns=()
+    local -A checked=()
     for entry in "${BROWSERS[@]}"
     do
-        IFS=':' read -r name binary _ _ <<< "$entry"
-
-        # Skip if we already checked this binary (e.g. chromium listed twice)
-        if [ -n "${checked[$binary]:-}" ]
+        IFS=: read -r name binary _ <<< "$entry"
+        pattern="$(browser_process_pattern "$binary")"
+        if [[ ! ${checked[$pattern]:-} ]] && pgrep -u "$SUDO_USER" -f -- "$pattern" >/dev/null
         then
-            continue
+            running+=("$name")
+            patterns+=("$pattern")
         fi
-        checked[$binary]=1
-
-        if pgrep -f "$binary" >/dev/null 2>&1
-        then
-            running_binaries+=("$binary")
-            if [ -n "$running" ]
-            then
-                running="$running, $name"
-            else
-                running="$name"
-            fi
-        fi
+        checked[$pattern]=1
     done
-
-    if [ -n "$running" ]
+    if [ "${#running[@]}" -eq 0 ]
     then
-        print_err "Running browser(s) detected: $running"
-
-        local choice=''
-        while [ "$choice" != "y" ] && [ "$choice" != "n" ]
-        do
-            echo -e "\nWould you like this script to close them for you? ${INFO_COLOR}(y/n)${NO_COLOR}"
-            read -rp '> ' choice
-        done
-
-        if [ "$choice" == "y" ]
-        then
-            for binary in "${running_binaries[@]}"
-            do
-                graceful_kill "$binary"
-            done
-            print_info "Browsers closed."
-        else
-            print_info "Please close all browsers and restart this script."
-            exit "$E_BROWSER"
-        fi
+        return 0
     fi
-} # check_running_browsers
-
-
-# Discovery of browsers installed on the user's system
-# Iterates the BROWSERS registry, detects installed browsers, initializes
-# their profile directories, and handles Firefox snap on Debian.
-browser_check ()
-{
-    print_info "Checking for supported browsers..."
-    local pki_initialized=false
-
-    for entry in "${BROWSERS[@]}"
-    do
-        IFS=':' read -r name binary db_pattern type <<< "$entry"
-
-        if ! command -v "$binary" >/dev/null 2>&1
-        then
-            continue
-        fi
-
-        print_info "Found $name."
-
-        # Firefox-specific: check for snap installation (Debian only)
-        if [ "$binary" == "firefox" ] && [ "$OS_FAMILY" == "debian" ]
-        then
-            local ff_path
-            ff_path="$(command -v firefox)"
-            if [[ "$ff_path" =~ snap ]]
-            then
-                snap_ff=true
-                print_err "This version of Firefox was installed as a snap package"
-                continue
-            elif grep -Fq "exec /snap/bin/firefox" "$ff_path" 2>/dev/null
-            then
-                snap_ff=true
-                print_err "This version of Firefox was installed as a snap package with a launch script"
-                continue
-            fi
-        fi
-
-        # Track this browser as compatible
-        found_browsers+=("$name")
-        found_db_patterns+=("$db_pattern")
-
-        # Initialize profile directory via headless launch
-        if [ "$type" == "chromium" ]
-        then
-            # All Chromium-based browsers share ~/.pki/nssdb — only init once
-            if [ "$pki_initialized" == false ]
-            then
-                print_info "Running $name to generate certificate database..."
-                run_browser "$binary" "--headless --disable-gpu"
-                pki_initialized=true
-                print_info "Done."
-            fi
-        else
-            print_info "Running $name to generate profile directory..."
-            run_browser "$binary" "--headless --first-startup"
-            print_info "Done."
-        fi
-    done
-
-    # No browsers found at all
-    if [ "${#found_browsers[@]}" -eq 0 ] && [ "$snap_ff" == false ]
+    print_info "Running browser(s) detected: ${running[*]}"
+    if ! ask_yes_no "Close these browsers?"
     then
-        print_err "No supported browsers detected."
-        print_info "Please install a supported browser (Firefox, Chrome, Chromium, Brave, Edge, LibreWolf, Waterfox, or Vivaldi)."
+        print_info "Close your browsers and restart setup."
         exit "$E_BROWSER"
     fi
+    for pattern in "${patterns[@]}"
+    do
+        pkill -TERM -u "$SUDO_USER" -f -- "$pattern"
+    done
+    sleep 2
+    for pattern in "${patterns[@]}"
+    do
+        pkill -KILL -u "$SUDO_USER" -f -- "$pattern"
+    done
+    sleep 1
+    for pattern in "${patterns[@]}"
+    do
+        if pgrep -u "$SUDO_USER" -f -- "$pattern" >/dev/null
+        then
+            print_err "A browser is still running. Close it and restart setup."
+            exit "$E_BROWSER"
+        fi
+    done
+}
 
-    # Handle snap Firefox on Debian
+browser_check ()
+{
+    local entry name binary
+    local -A detected=()
+    for entry in "${BROWSERS[@]}"
+    do
+        IFS=: read -r name binary _ <<< "$entry"
+        command -v "$binary" >/dev/null || continue
+        [[ ${detected[$name]:-} ]] && continue
+        if [[ "$binary" == firefox && "$OS_FAMILY" == debian ]] && is_snap_firefox
+        then
+            snap_ff=true
+            continue
+        fi
+        print_info "Found $name."
+        selected_browsers+=("$entry")
+        found_browsers+=("$name")
+        detected[$name]=1
+    done
+
     if [ "$snap_ff" == true ]
     then
-        echo -e "
-        ********************${ERR_COLOR}[ WARNING ]${NO_COLOR}********************
-        * The version of Firefox you have installed       *
-        * currently was installed via snap.               *
-        * This version of Firefox is not currently        *
-        * compatible with the method used to enable CAC   *
-        * support in browsers.                            *
-        *                                                 *
-        * As a work-around, this script can automatically *
-        * remove the snap version and reinstall via apt.  *
-        *                                                 *
-        * The option to attempt to migrate all of your    *
-        * personalizations will be given if you choose to *
-        * replace Firefox via this script. Your Firefox   *
-        * profile will be saved to a temp location, then  *
-        * will overwrite the default profile once the apt *
-        * version of Firefox has been installed.          *
-        *                                                 *
-        ********************${ERR_COLOR}[ WARNING ]${NO_COLOR}********************\n"
-
-        # Prompt user to elect to replace snap firefox with apt firefox
-        choice=''
-        while [ "$choice" != "y" ] && [ "$choice" != "n" ]
-        do
-            echo -e "\nWould you like to switch to the apt version of Firefox? ${INFO_COLOR}(y/n)${NO_COLOR}"
-            read -rp '> ' choice
-        done
-
-        if [ "$choice" == "y" ]
+        print_info "This fork configures native Firefox. You can replace the Firefox snap with the apt version."
+        if ask_yes_no "Switch to native Firefox and remove the snap?"
         then
-            reconfigure_firefox
+            found_browsers+=("Firefox")
         else
-            if [ "${#found_browsers[@]}" -eq 0 ]
-            then
-                print_info "You have elected to keep the snap version of Firefox.\n"
-                print_err "You have no compatible browsers. Exiting..."
-                exit "$E_BROWSER"
-            fi
+            snap_ff=false
         fi
     fi
-} # browser_check
-
-
-# Locate and backup the profile for the user's snap version of Firefox
-# Backup is placed in /tmp/ff_old_profile/ and can be restored after the
-# apt version of Firefox has been installed
-backup_ff_profile ()
-{
-    local location
-    location="$(find_db "firefox" | grep "snap")"
-    if [ -z "$location" ]
+    if [ "${#found_browsers[@]}" -eq 0 ]
     then
-        print_info "No user profile was found in snap-installed version of Firefox."
-    else
-        # A user profile exists in the snap version of FF
-        choice=''
-        while [ "$choice" != "y" ] && [ "$choice" != "n" ]
-        do
-            echo -e "\nWould you like to transfer your bookmarks and personalizations to the new version of Firefox? ${INFO_COLOR}(y/n)${NO_COLOR}"
-            read -rp '> ' choice
-        done
-
-        if [ "$choice" == "y" ]
-        then
-            print_info "Backing up Firefox profile"
-            ff_profile="$(dirname "$location")"
-            sudo -H -u "$SUDO_USER" cp -rf "$ff_profile" "$DWNLD_DIR/$FF_PROFILE_NAME"
-            backup_exists=true
-        fi
-
+        print_err "No compatible browser selected. Install a supported native browser and rerun setup."
+        exit "$E_BROWSER"
     fi
-} # backup_ff_profile
+}
 
-
-# Moves the user's backed up Firefox profile from the temp location to the newly
-# installed apt version of Firefox in the ~/.mozilla directory
-migrate_ff_profile ()
+init_browser_dbs ()
 {
-    local direction=$1
-
-    if [ "$direction" == "migrate" ]
-    then
-        # Find the apt Firefox profile directory. We search for the profile
-        # folder (*.default*) rather than cert9.db because the database may
-        # not exist yet after a fresh install and headless launch.
-        local apt_ff_profile_dir
-        apt_ff_profile_dir="$(find "$ORIG_HOME/.mozilla/firefox" -maxdepth 1 -type d -name "*.default*" 2>/dev/null | grep -v "snap" | head -n 1)"
-        if [ -z "$apt_ff_profile_dir" ]
+    local entry binary type
+    local pki_initialized=false
+    for entry in "${selected_browsers[@]}"
+    do
+        IFS=: read -r _ binary type <<< "$entry"
+        if [ "$type" == chromium ]
         then
-            print_err "Something went wrong while trying to find apt Firefox's user profile directory."
-            exit "$E_DATABASE"
-        else
-            if sudo -H -u "$SUDO_USER" cp -rf "$DWNLD_DIR/$FF_PROFILE_NAME"/* "$apt_ff_profile_dir"
+            if [ "$pki_initialized" == false ]
             then
-                print_info "Successfully migrated user profile for Firefox versions"
-            else
-                print_err "Unable to migrate Firefox profile"
+                init_chromium_dbs || exit "$E_DATABASE"
+                pki_initialized=true
             fi
+        else
+            init_browser_profile_dbs "$binary" || exit "$E_DATABASE"
         fi
-    elif [ "$direction" == "restore" ]
+    done
+    if [ "$snap_ff" == true ]
     then
-        local location
-        location="$(find_db "firefox" | grep "snap")"
-        if [ -z "$location" ]
-        then
-            print_info "No user profile was found in snap-installed version of Firefox."
-        else
-            local ff_profile_dir
-            ff_profile_dir="$(dirname "$location")"
-            if sudo -H -u "$SUDO_USER" cp -rf "$DWNLD_DIR/$FF_PROFILE_NAME"/* "$ff_profile_dir"
-            then
-                print_info "Successfully restored user profile for Firefox"
-            else
-                print_err "Unable to migrate Firefox profile"
-            fi
-        fi
+        reconfigure_firefox || exit "$E_BROWSER"
     fi
+}
 
-} # migrate_ff_profile
-
-
-# Reinstall the user's previous version of Firefox if the snap version was
-# removed in the process of this script.
-revert_firefox ()
-{
-    # Firefox was replaced, let's put it back where it was.
-    print_err "No valid databases located. Reinstalling previous version of Firefox..."
-    DEBIAN_FRONTEND=noninteractive apt purge firefox -y
-    snap install firefox
-    run_browser "firefox" "--headless --first-startup"
-    print_info "Completed. Exiting..."
-    # "Restore" the old profile back to the snap version of Firefox
-    migrate_ff_profile "restore"
-
-    exit "$E_DATABASE"
-} # revert_firefox
-
-
-# Integrate all certificates into the databases for existing browsers
 import_certs ()
 {
-    local db="$1"
-    local db_root cert imported=0 failed=0
-    db_root="$(dirname "$db")"
-    if [ -n "$db_root" ]
-    then
-        case "$db_root" in
-            *"pki"*)
-                print_info "Importing certificates for Chromium-based browser..."
-                ;;
-            *"firefox"*)
-                print_info "Importing certificates for Firefox..."
-                ;;
-            *"librewolf"*)
-                print_info "Importing certificates for LibreWolf..."
-                ;;
-            *"waterfox"*)
-                print_info "Importing certificates for Waterfox..."
-                ;;
-            *)
-                print_info "Importing certificates..."
-                ;;
-        esac
-
-        print_info "Loading certificates into $db_root"
-
-        for cert in "$DWNLD_DIR/$CERT_FILENAME/"*."$CERT_EXTENSION"
-        do
-            if certutil -d sql:"$db_root" -A -t TC -n "$cert" -i "$cert" 2>/dev/null
-            then
-                imported=$((imported + 1))
-            else
-                failed=$((failed + 1))
-            fi
-        done
-
-        if [ "$failed" -gt 0 ]
+    local db="$1" cert imported=0 failed=0
+    print_info "Loading certificates into $db"
+    for cert in "${cert_files[@]}"
+    do
+        if as_user certutil -d "sql:$db" -A -t TC -n "${cert##*/}" -i "$cert"
         then
-            print_err "Imported $imported certificate(s), $failed failed for $db_root"
+            imported=$((imported + 1))
         else
-            print_info "Imported $imported certificate(s)."
+            print_err "Could not import ${cert##*/} into $db"
+            failed=$((failed + 1))
         fi
-        total_imported=$((total_imported + imported))
-    fi
-    echo
-} # import_certs
+    done
+    total_imported=$((total_imported + imported))
+    print_info "Imported $imported certificate(s) into $db."
+    [ "$failed" -eq 0 ]
+}
 
-
-# Check to see if the user has Firefox pinned to their favorites bar in GNOME
+# Keep the existing position of a pinned Firefox launcher during migration.
 check_for_ff_pin ()
 {
-    if [ -z "$XDG_CURRENT_DESKTOP" ]; then
-        print_info "Desktop environment information not available."
-        return
-    fi
-
-    if [[ "$XDG_CURRENT_DESKTOP" =~ [Gg][Nn][Oo][Mm][Ee] ]]
+    local favorites
+    if [[ "${XDG_CURRENT_DESKTOP:-}" =~ [Gg][Nn][Oo][Mm][Ee] ]] &&
+        favorites="$(as_user gsettings get org.gnome.shell favorite-apps)"
     then
-        print_info "Detected GNOME-based desktop environment"
-        curr_favorites=$(gsettings get org.gnome.shell favorite-apps)
-        if [[ "$curr_favorites" =~ firefox\.desktop ]]
+        if [[ "$favorites" == *"'firefox.desktop'"* || "$favorites" == *"'firefox_firefox.desktop'"* ]]
         then
             ff_was_pinned=true
         fi
-    else
-        print_err "Unsupported desktop environment."
-        print_err "Unable to repin Firefox to favorites bar"
-        print_info "Firefox can still be pinned manually"
     fi
-} # check_for_ff_pin
-
+}
 
 repin_firefox ()
 {
-    print_info "Attempting to repin Firefox to favorites bar..."
-    if [ "$ff_was_pinned" == true ]
-    then
-        print_info "Pinning Firefox to favorites bar"
-        gsettings set org.gnome.shell favorite-apps "$(gsettings get org.gnome.shell favorite-apps | sed s/.$//), 'firefox.desktop']"
-        print_info "Done."
-    fi
-} # repin_firefox
+    local favorites snap_id="'firefox_firefox.desktop'" native_id="'firefox.desktop'"
+    [ "$ff_was_pinned" == true ] || return 0
+    favorites="$(as_user gsettings get org.gnome.shell favorite-apps)" || return 0
+    case "$favorites" in
+        *"$native_id"*) return 0 ;;
+        *"$snap_id"*) favorites="${favorites/"$snap_id"/"$native_id"}" ;;
+        '[]'|'@as []') favorites="[$native_id]" ;;
+        *) favorites="${favorites%]}, $native_id]" ;;
+    esac
+    as_user gsettings set org.gnome.shell favorite-apps "$favorites" || print_info "Pin Firefox manually in GNOME Favorites."
+}
 
 
 # Detect the Linux distribution family and set OS_FAMILY accordingly
@@ -776,7 +617,7 @@ install_packages ()
             dnf install -y pcsc-lite pcsc-lite-ccid opensc nss-tools unzip wget pcsc-tools || return 1
             ;;
         arch)
-            pacman -Sy --noconfirm pcsclite ccid opensc nss unzip wget pcsc-tools || return 1
+            pacman -S --needed --noconfirm pcsclite ccid opensc nss unzip wget pcsc-tools || return 1
             ;;
     esac
 } # install_packages
@@ -810,7 +651,7 @@ find_opensc_module ()
 
     # Fall back to searching the common library roots
     local found
-    found="$(find /usr/lib /usr/lib64 -name opensc-pkcs11.so 2>/dev/null | head -n 1)"
+    found="$(find /usr/lib /usr/lib64 -name opensc-pkcs11.so -print -quit 2>/dev/null)"
     if [ -n "$found" ]
     then
         echo "$found"
@@ -829,18 +670,32 @@ load_pkcs11_module ()
     local db_root="$1"
     local module="$2"
 
-    if sudo -H -u "$SUDO_USER" modutil -dbdir sql:"$db_root" -list 2>/dev/null | grep -qF "$MODULE_NAME"
+    # Older installations may have registered the same library under another
+    # display name. modutil reports the library path independently of its name.
+    local listing
+    if ! listing="$(as_user env LC_ALL=C modutil -dbdir "sql:$db_root" -list)"
+    then
+        print_err "Could not list security modules in $db_root"
+        return 1
+    fi
+    if awk '
+        /^[[:space:]]*[0-9]+\./ { opensc = 0 }
+        /^[[:space:]]*library name: (.*\/)?opensc-pkcs11\.so$/ { opensc = 1 }
+        opensc && /^[[:space:]]*status: loaded$/ { loaded = 1 }
+        END { exit !loaded }
+    ' <<< "$listing"
     then
         print_info "Module already present in $db_root"
         return 0
     fi
 
     # -force suppresses modutil's interactive confirmation prompt
-    if sudo -H -u "$SUDO_USER" modutil -dbdir sql:"$db_root" -add "$MODULE_NAME" -libfile "$module" -force >/dev/null 2>&1
+    if as_user modutil -dbdir "sql:$db_root" -add "$MODULE_NAME" -libfile "$module" -force >/dev/null
     then
         print_info "Loaded module into $db_root"
     else
         print_err "Failed to load module into $db_root"
+        return 1
     fi
 } # load_pkcs11_module
 
@@ -857,14 +712,16 @@ verify_pkcs11 ()
     fi
 
     print_info "Verifying OpenSC PKCS#11 module registration..."
-    if p11-kit list-modules 2>/dev/null | grep -qi opensc
+    if as_user p11-kit list-modules 2>/dev/null | grep -qi opensc
     then
         print_info "OpenSC PKCS#11 module is registered with p11-kit."
     else
-        print_err "OpenSC PKCS#11 module not visible to p11-kit. If browsers do not prompt for your PIN, reinstall the 'opensc' package."
+        print_info "p11-kit did not report OpenSC. Browser databases use the directly registered module."
     fi
     print_info "Done"
 } # verify_pkcs11
 
-
-main
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]
+then
+    main
+fi

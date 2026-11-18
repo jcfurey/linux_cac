@@ -3,17 +3,16 @@
 <p align='center'>
   <a href="https://github.com/sponsors/jdjaxon"><img alt="Sponsor" src="https://img.shields.io/badge/sponsor-30363D?style=flat&logo=GitHub-Sponsors&logoColor=#white" /></a>
   &nbsp;
-  <a href="#"><img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/jdjaxon/linux_cac?style=flat&labelColor=30363D&color=gray" /></a>
+  <a href="https://github.com/jcfurey/linux_cac"><img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/jcfurey/linux_cac?style=flat&labelColor=30363D&color=gray" /></a>
   &nbsp;
-  <a href="https://github.com/jdjaxon/linux_cac/actions/workflows/CI.yml"><img alt="CI" src="https://github.com/jdjaxon/linux_cac/actions/workflows/CI.yml/badge.svg?" /></a>
+  <a href="https://github.com/jcfurey/linux_cac/actions/workflows/CI.yml"><img alt="CI" src="https://github.com/jcfurey/linux_cac/actions/workflows/CI.yml/badge.svg?" /></a>
 </p>
 
 A project for configuring Linux distributions to work with Common Access Cards
 (CACs). Supports Debian/Ubuntu, Fedora/RHEL/CentOS, and Arch Linux. On
-Debian-family systems, the snap version of Firefox is not compatible with the
-certificate import method — the script can replace it with the apt version
-automatically. Before using this project, please review the
-[Known Issues](#known-issues) section.
+Debian-family systems, this fork configures native Firefox and can migrate a
+Firefox snap installation to the apt version. See [Known Issues](#known-issues)
+for migration details.
 
 > [!note]
 > This project has moved from using Cackey to OpenSC, which seems to be
@@ -44,9 +43,7 @@ automatically. Before using this project, please review the
 
 Regardless of how similar two distributions may be, I will only list
 distributions and versions here that I know have been tested with this method.
-On Debian-family systems since Ubuntu 22.04, Firefox will only work if you
-allow the script to remove the `snap` version and reinstall the browser with
-`apt`.
+This fork supports native Firefox packages, including Firefox ESR.
 
 | Family | Distribution | Versions | Browsers |
 | :-: | :-: | :-: | :-: |
@@ -68,13 +65,11 @@ allow the script to remove the `snap` version and reinstall the browser with
 > [!warning]
 >  Please make sure all browsers are closed before running the script.
 
-This script requires root privileges since it installs the `opensc` package and
-its dependencies. Feel free to review the script
-[here](https://raw.githubusercontent.com/jdjaxon/linux_cac/main/cac_setup.sh)
-if this makes you uncomfortable. For transparency, the
-DoD certificates are downloaded from
-[here](https://militarycac.com/maccerts/AllCerts.zip), which are
-recommended by [militarycac](https://militarycac.com).
+Run the installer with `sudo` from your regular desktop account. It installs
+OpenSC and starts the smart-card service with root privileges. It imports
+certificates and registers OpenSC in browser databases as your desktop user.
+You can review the [installer in this fork](./cac_setup.sh) and the
+[certificate bundle from MilitaryCAC](https://militarycac.com/maccerts/AllCerts.zip).
 
 > [!note]
 > - The automated installation requires `wget` and `unzip` to run and will
@@ -87,14 +82,16 @@ recommended by [militarycac](https://militarycac.com).
 
 
 #### Methods
-- `wget`
+
+From a checkout of this fork, run `sudo bash ./cac_setup.sh`. To download the
+installer from the fork's `main` branch, run either command in an empty directory.
+
 ```bash
-sudo bash -c "$(wget https://raw.githubusercontent.com/jdjaxon/linux_cac/main/cac_setup.sh -O -)"
+wget -O cac_setup.sh https://raw.githubusercontent.com/jcfurey/linux_cac/main/cac_setup.sh && sudo bash ./cac_setup.sh
 ```
 
-- `curl`
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/jdjaxon/linux_cac/main/cac_setup.sh)"
+curl -fsSLo cac_setup.sh https://raw.githubusercontent.com/jcfurey/linux_cac/main/cac_setup.sh && sudo bash ./cac_setup.sh
 ```
 
 ## Known Issues
@@ -103,22 +100,20 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/jdjaxon/linux_cac/m
   not prompt for your PIN after setup, make sure it is fully closed (including
   background processes) and reboot, then try again.
 
-- Firefox and Chrome both need to be started at least once to initialize their
-  respective certificate databases/profiles.
+- Setup initializes the shared Chromium NSS database and registers each Firefox
+  profile listed in `profiles.ini`. If Firefox cannot create its initial profile
+  headlessly, start it once, close it, and rerun setup.
 
-- Ubuntu 21.10 and greater (to include the latest LTS 22.04) have Firefox
-  installed via snap by default. There is an outstanding bug
-  (https://bugzilla.mozilla.org/show_bug.cgi?id=1734371) that prevents Firefox
-  from being able to read the certificates. One solution could be to uninstall
-  Firefox from snap and reinstall it via `apt`. This current version of the
-  script will attempt to do the reinstallation for you.
+- On Debian-family systems with snap Firefox, you can keep the snap and configure another
+  installed browser, or opt into replacing it with native Firefox from the
+  Mozilla Team PPA. Automatic transfer supports a single source profile. If
+  migration fails after backup, the installer prints the backup directory.
 
 - If you run into any issues with Firefox after running the script, clear your
   data and history in `Privacy & Security` and then restart Firefox. If your
   troubles are with MS Teams, see the section for [troubleshooting
-  teams](#microsoft-teams). Chrome is recommended for MS Teams since Firefox
-  does not currently support Teams meetings. You can see more about this
-  [here](https://support.microsoft.com/en-us/office/join-a-teams-meeting-on-an-unsupported-browser-daafdd3c-ac7a-4855-871b-9113bad15907).
+  teams](#microsoft-teams). Microsoft lists the supported Linux browsers in its
+  [Teams for Web requirements](https://learn.microsoft.com/en-us/microsoftteams/teams-client-web).
 
 - Firefox will likely start up a bit slower after running this installation.
 
@@ -172,7 +167,10 @@ Thank you for your interest in contributing to **linux_cac**! Whether you're fix
    Keep commits focused and meaningful. Update or add documentation if needed.
 
 6. **Test your changes**
-   Ensure your changes don’t break existing functionality. If applicable, add tests.
+
+   Run `shellcheck -x cac_setup.sh tests/setup.sh` and `bash tests/setup.sh`.
+   The tests use temporary profiles, NSS tools, OpenSC, OpenSSL, zip, and unzip.
+   They run as your regular user without a CAC reader.
 
 7. **Push to your fork and open a Pull Request**
    ```
@@ -183,10 +181,10 @@ Thank you for your interest in contributing to **linux_cac**! Whether you're fix
 ### Guidelines
 - Follow existing code style and conventions.
 - Keep changes atomic and well-documented in commit messages.
-- For larger changes or features, please open an issue first to discuss your proposal.
 
 ### Need Help?
-If you run into any issues or have questions, feel free to open an issue or reach out.
+For fork changes, open a [pull request against jcfurey/linux_cac](https://github.com/jcfurey/linux_cac/pulls).
+Shared browser and distribution issues are tracked in the [upstream issue tracker](https://github.com/jdjaxon/linux_cac/issues).
 
 
 ## License

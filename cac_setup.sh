@@ -41,7 +41,7 @@ BROWSERS=(
 
 main ()
 {
-    snap_ff=false                       # Flag to prompt for how to handle snap Firefox
+    snap_ff=false                       # Firefox snap was detected
     backup_exists=false                 # Whether a Firefox profile backup was made
     ff_was_pinned=false                 # Whether Firefox was pinned in GNOME favorites
     OS_FAMILY=""                        # Detected OS family (debian/fedora/arch)
@@ -51,6 +51,7 @@ main ()
     total_imported=0                    # Running count of certificates imported
 
     local -a selected_browsers=()
+    local -A snap_databases=()
     found_browsers=()
     databases=()
 
@@ -78,8 +79,12 @@ main ()
         exit "$E_DATABASE"
     fi
 
-    local opensc_module
-    if ! opensc_module="$(find_opensc_module)"
+    local opensc_module module_scope=native
+    if [ "${#snap_databases[@]}" -gt 0 ]
+    then
+        module_scope=snap
+    fi
+    if ! opensc_module="$(find_opensc_module "$module_scope")"
     then
         print_err "Could not locate opensc-pkcs11.so. Check the OpenSC package installation."
         exit "$E_DATABASE"
@@ -113,7 +118,7 @@ main ()
     for db in "${databases[@]}"
     do
         import_certs "$db" || failed=1
-        load_pkcs11_module "$db" "$opensc_module" || failed=1
+        load_pkcs11_module "$db" "$opensc_module" "${snap_databases[$db]:-native}" || failed=1
     done
 
     if [ "$failed" -ne 0 ]
@@ -164,10 +169,17 @@ cleanup ()
 # Keep one entry per NSS directory, including when browser commands are aliases.
 init_nss_db ()
 {
-    local dir="$1" db
+    local dir="$1" scope="${2:-native}" db
     for db in "${databases[@]}"
     do
-        [[ "$db" -ef "$dir" ]] && return 0
+        if [[ "$db" -ef "$dir" ]]
+        then
+            if [ "$scope" == snap ]
+            then
+                snap_databases["$db"]=snap
+            fi
+            return 0
+        fi
     done
     if [ ! -f "$dir/$DB_FILENAME" ]
     then
@@ -178,6 +190,10 @@ init_nss_db ()
         fi
     fi
     databases+=("$dir")
+    if [ "$scope" == snap ]
+    then
+        snap_databases["$dir"]=snap
+    fi
 }
 
 # Read profile paths ([ProfileN] Path) or install defaults ([Install...] Default)
@@ -217,10 +233,15 @@ firefox_profiles ()
 
 init_browser_profile_dbs ()
 {
-    local binary="$1" profile
-    local -a roots profiles
+    local binary="$1" scope="${2:-native}" profile profile_home="$ORIG_HOME"
+    local -a roots profiles launcher=("$binary")
+    if [ "$scope" == snap ]
+    then
+        profile_home="$ORIG_HOME/snap/firefox/common"
+        launcher=(snap run firefox)
+    fi
     case "$binary" in
-        firefox|firefox-esr) roots=("$ORIG_HOME/.mozilla/firefox" "$ORIG_HOME/.config/mozilla/firefox") ;;
+        firefox|firefox-esr) roots=("$profile_home/.mozilla/firefox" "$profile_home/.config/mozilla/firefox") ;;
         librewolf) roots=("$ORIG_HOME/.librewolf" "$ORIG_HOME/.config/librewolf") ;;
         waterfox)  roots=("$ORIG_HOME/.waterfox" "$ORIG_HOME/.config/waterfox") ;;
     esac
@@ -231,7 +252,7 @@ init_browser_profile_dbs ()
         # Let the browser select its default profile and exit on its own.
         # -CreateProfile alone can leave a named profile unused on first launch.
         print_info "Initializing the default $binary profile..."
-        if ! as_user timeout -k 5 60 "$binary" --headless --no-remote --screenshot /dev/null about:blank >/dev/null
+        if ! as_user timeout -k 5 60 "${launcher[@]}" --headless --no-remote --screenshot /dev/null about:blank >/dev/null
         then
             print_err "Could not initialize $binary. Start and close it, then rerun setup."
             return 1
@@ -245,7 +266,7 @@ init_browser_profile_dbs ()
     fi
     for profile in "${profiles[@]}"
     do
-        init_nss_db "$profile" || return 1
+        init_nss_db "$profile" "$scope" || return 1
     done
 }
 
@@ -317,9 +338,11 @@ user_check ()
 
 is_snap_firefox ()
 {
-    local launcher
+    local launcher snap_cli
     launcher="$(command -v firefox)" || return 1
-    [[ "$launcher" == */snap/bin/firefox ]] || grep -Fq 'exec /snap/bin/firefox' "$launcher"
+    snap_cli="$(type -P snap)"
+    [[ "$launcher" == */snap/bin/firefox || "$launcher" -ef "$snap_cli" ]] ||
+        grep -IFq 'exec /snap/bin/firefox' "$launcher"
 }
 
 ask_yes_no ()
@@ -468,32 +491,58 @@ browser_check ()
     for entry in "${BROWSERS[@]}"
     do
         IFS=: read -r name binary _ <<< "$entry"
+        if [[ "$binary" == firefox && "$OS_FAMILY" == debian ]]
+        then
+            if is_snap_firefox
+            then
+                snap_ff=true
+                continue
+            fi
+            # sudo's PATH may omit /snap/bin. The snap may also coexist with
+            # native Firefox, in which case both have their own profiles.
+            if command -v snap >/dev/null && snap list firefox >/dev/null 2>&1
+            then
+                snap_ff=true
+            fi
+        fi
         command -v "$binary" >/dev/null || continue
         [[ ${detected[$name]:-} ]] && continue
-        if [[ "$binary" == firefox && "$OS_FAMILY" == debian ]] && is_snap_firefox
-        then
-            snap_ff=true
-            continue
-        fi
         print_info "Found $name."
         selected_browsers+=("$entry")
         found_browsers+=("$name")
         detected[$name]=1
     done
 
-    if [ "$snap_ff" == true ]
+    if [ "${#found_browsers[@]}" -eq 0 ] && [ "$snap_ff" == false ]
     then
-        print_info "This fork configures native Firefox. You can replace the Firefox snap with the apt version."
-        if ask_yes_no "Switch to native Firefox and remove the snap?"
-        then
-            found_browsers+=("Firefox")
-        else
-            snap_ff=false
-        fi
+        print_err "No supported browser found. Install a supported browser and rerun setup."
+        exit "$E_BROWSER"
     fi
-    if [ "${#found_browsers[@]}" -eq 0 ]
+}
+
+configure_firefox_snap ()
+{
+    print_info "Connecting Firefox Snap to the smart-card service..."
+    if snap connections firefox | awk '
+        $1 == "pcscd" && $2 == "firefox:pcscd" && $3 ~ /:pcscd$/ { connected = 1 }
+        END { exit !connected }
+    ' ||
+        snap connect firefox:pcscd
     then
-        print_err "No compatible browser selected. Install a supported native browser and rerun setup."
+        init_browser_profile_dbs firefox snap || exit "$E_DATABASE"
+        found_browsers+=("Firefox (Snap)")
+        return 0
+    fi
+
+    print_err "Could not connect firefox:pcscd. Check 'snap connections firefox' and rerun setup."
+    if is_snap_firefox && ask_yes_no "Replace the Firefox snap with native Firefox from the Mozilla Team PPA?"
+    then
+        reconfigure_firefox || exit "$E_BROWSER"
+        found_browsers+=("Firefox")
+    elif [ "${#found_browsers[@]}" -gt 0 ] && ask_yes_no "Skip Firefox Snap and configure the other detected browsers?"
+    then
+        print_info "Skipping Firefox Snap."
+    else
         exit "$E_BROWSER"
     fi
 }
@@ -518,7 +567,7 @@ init_browser_dbs ()
     done
     if [ "$snap_ff" == true ]
     then
-        reconfigure_firefox || exit "$E_BROWSER"
+        configure_firefox_snap
     fi
 }
 
@@ -628,6 +677,18 @@ install_packages ()
 # locations and fall back to a search. Prints the path on success.
 find_opensc_module ()
 {
+    # The snap exposes this exact multiarch path inside confinement. Other
+    # host paths can load in modutil but be inaccessible to the browser.
+    if [ "${1:-native}" == snap ]
+    then
+        local arch files path
+        arch="$(dpkg --print-architecture)" || return 1
+        files="$(dpkg-query -L "opensc-pkcs11:$arch")" || return 1
+        path="$(awk '/^\/usr\/lib\/[^/]+\/opensc-pkcs11\.so$/ { print; exit }' <<< "$files")"
+        [ -f "$path" ] || return 1
+        printf '%s\n' "$path"
+        return 0
+    fi
     local arch_dir
     arch_dir="$(uname -m)-linux-gnu"
     local candidates=(
@@ -678,9 +739,12 @@ load_pkcs11_module ()
         print_err "Could not list security modules in $db_root"
         return 1
     fi
-    if awk '
+    if awk -v scope="${3:-native}" -v module="$module" '
         /^[[:space:]]*[0-9]+\./ { opensc = 0 }
-        /^[[:space:]]*library name: (.*\/)?opensc-pkcs11\.so$/ { opensc = 1 }
+        /^[[:space:]]*library name: (.*\/)?opensc-pkcs11\.so$/ {
+            sub(/^[[:space:]]*library name: /, "")
+            opensc = (scope != "snap" || $0 == module)
+        }
         opensc && /^[[:space:]]*status: loaded$/ { loaded = 1 }
         END { exit !loaded }
     ' <<< "$listing"
@@ -695,6 +759,10 @@ load_pkcs11_module ()
         print_info "Loaded module into $db_root"
     else
         print_err "Failed to load module into $db_root"
+        if [ "${3:-native}" == snap ]
+        then
+            print_err "Check OpenSC in Firefox Snap's Security Devices for this profile. The module filename should be $module."
+        fi
         return 1
     fi
 } # load_pkcs11_module

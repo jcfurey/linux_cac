@@ -10,9 +10,8 @@
 
 A project for configuring Linux distributions to work with Common Access Cards
 (CACs). Supports Debian/Ubuntu, Fedora/RHEL/CentOS, and Arch Linux. On
-Debian-family systems, this fork configures native Firefox and can migrate a
-Firefox snap installation to the apt version. See [Known Issues](#known-issues)
-for migration details.
+Debian-family systems, setup can configure Firefox Snap in place, including
+installations with multiple Firefox profiles.
 
 > [!note]
 > This project has moved from using Cackey to OpenSC, which seems to be
@@ -43,7 +42,8 @@ for migration details.
 
 Regardless of how similar two distributions may be, I will only list
 distributions and versions here that I know have been tested with this method.
-This fork supports native Firefox packages, including Firefox ESR.
+This fork supports native Firefox packages, including Firefox ESR, and Firefox
+Snap on Debian-family systems.
 
 | Family | Distribution | Versions | Browsers |
 | :-: | :-: | :-: | :-: |
@@ -104,10 +104,11 @@ curl -fsSLo cac_setup.sh https://raw.githubusercontent.com/jcfurey/linux_cac/mai
   profile listed in `profiles.ini`. If Firefox cannot create its initial profile
   headlessly, start it once, close it, and rerun setup.
 
-- On Debian-family systems with snap Firefox, you can keep the snap and configure another
-  installed browser, or opt into replacing it with native Firefox from the
-  Mozilla Team PPA. Automatic transfer supports a single source profile. If
-  migration fails after backup, the installer prints the backup directory.
+- Firefox Snap needs the `firefox:pcscd` connection to access the card reader.
+  Setup connects it and registers OpenSC separately in each Snap profile. If
+  the connection fails, check `snap connections firefox`. Setup can also offer
+  migration to native Firefox from the Mozilla Team PPA. Migration requires
+  confirmation and supports a single source profile. [Ubuntu smart-card guide](https://ubuntu.com/tutorials/enable-smart-cards-in-snapped-browsers)
 
 - If you run into any issues with Firefox after running the script, clear your
   data and history in `Privacy & Security` and then restart Firefox. If your

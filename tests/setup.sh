@@ -114,6 +114,98 @@ expect_status "$E_DATABASE" with_missing_module
 expect_status "$E_DATABASE" with_unloadable_module
 expect_status 1 with_service_failure
 
+# Firefox Snap uses the Debian multiarch OpenSC package. Run the installer
+# twice with real NSS tools and a stand-in for the snap service and launcher.
+if [ -f /etc/debian_version ]
+then
+    (
+        detect_os () { OS_FAMILY=debian; }
+        install_native_firefox () { touch "$scratch/unexpected-migration"; return 1; }
+        test_home="$scratch/snap-home"
+        export snap_fixture="$test_home/snap/firefox/common/.mozilla/firefox"
+        mkdir -p "$test_home/bin"
+        export PATH="$test_home/bin:$PATH"
+        printf '#!/bin/sh\nexec /snap/bin/firefox "$@"\n' > "$test_home/bin/firefox"
+        cat > "$test_home/bin/snap" <<'SNAP'
+#!/bin/sh
+set -eu
+case "$1 $2" in
+    'list firefox') exit 0 ;;
+    'connections firefox')
+        slot=-
+        [ ! -e "$snap_fixture.connected" ] || slot=:pcscd
+        printf 'pcscd  firefox:pcscd  %s  manual\n' "$slot" ;;
+    'connect firefox:pcscd')
+        [ ! -e "$snap_fixture.fail" ] && [ ! -e "$snap_fixture.connected" ] || exit 1
+        touch "$snap_fixture.connected" ;;
+    'run firefox')
+        [ -e "$snap_fixture.connected" ] && [ ! -e "$snap_fixture/profiles.ini" ] || exit 1
+        mkdir -p "$snap_fixture/First profile" "$snap_fixture/second"
+        printf '[Profile0]\nPath=First profile\n[Profile1]\nPath=second\n' > "$snap_fixture/profiles.ini" ;;
+    *) exit 1 ;;
+esac
+SNAP
+        chmod +x "$test_home/bin/"{snap,firefox}
+        BROWSERS=('Firefox:firefox:firefox')
+        mkdir "$test_home/sudo-path"
+        ln -s "$test_home/bin/snap" "$test_home/sudo-path/snap"
+        (
+            OS_FAMILY=debian
+            snap_ff=false
+            selected_browsers=()
+            found_browsers=()
+            PATH="$test_home/sudo-path" browser_check
+            [[ "$snap_ff" == true && "${#selected_browsers[@]}" == 0 ]]
+        )
+        mkdir -p "${snap_fixture%/*}" "$test_home/.mozilla/firefox/native"
+        printf '[Profile0]\nPath=native\n' > "$test_home/.mozilla/firefox/profiles.ini"
+        snap_module="$(find_opensc_module snap)"
+        for pass in first second
+        do
+            (main) </dev/null > "$scratch/snap-$pass.log"
+            grep -Fq 'Configured browser(s): Firefox (Snap)' "$scratch/snap-$pass.log"
+            grep -q 'Certificate databases updated: 2' "$scratch/snap-$pass.log"
+            for db in "$snap_fixture/First profile" "$snap_fixture/second"
+            do
+                certutil -L -d "sql:$db" -n 'Test CA.cer' -r | cmp - "$scratch/Test CA.cer"
+                listing="$(modutil -dbdir "sql:$db" -list)"
+                [[ "$(grep -Fc "library name: $snap_module" <<< "$listing")" == 1 ]]
+            done
+        done
+        [[ ! -e "$test_home/.mozilla/firefox/native/cert9.db" ]]
+
+        # A failed connection cannot report success or silently remove Firefox.
+        rm "$snap_fixture.connected"
+        touch "$snap_fixture.fail"
+        expect_status "$E_BROWSER" main </dev/null
+        grep -Fq 'Could not connect firefox:pcscd' "$scratch/failure.log"
+        [[ ! -e "$scratch/unexpected-migration" ]]
+
+        # A native Firefox launcher can coexist with an installed snap.
+        rm "$snap_fixture.fail"
+        printf '#!/bin/sh\nexit 1\n' > "$test_home/bin/firefox"
+        (main) </dev/null > "$scratch/coexist.log"
+        grep -Fq 'Configured browser(s): Firefox Firefox (Snap)' "$scratch/coexist.log"
+        grep -q 'Certificate databases updated: 3' "$scratch/coexist.log"
+        certutil -L -d "sql:$test_home/.mozilla/firefox/native" -n 'Test CA.cer' >/dev/null
+
+        # A host-only library alias may load in modutil outside confinement.
+        # A successful result must always leave the snap-visible path registered.
+        db="$scratch/old-snap-registration"
+        mkdir "$db"
+        ln -s "$snap_module" "$db/opensc-pkcs11.so"
+        certutil -N -d "sql:$db" --empty-password
+        modutil -dbdir "sql:$db" -add "$MODULE_NAME" -libfile "$db/opensc-pkcs11.so" -force >/dev/null
+        if load_pkcs11_module "$db" "$snap_module" snap > "$scratch/old-module.log" 2>&1
+        then
+            listing="$(modutil -dbdir "sql:$db" -list)"
+            grep -Fq "library name: $snap_module" <<< "$listing"
+        else
+            grep -Fq "module filename should be $snap_module" "$scratch/old-module.log"
+        fi
+    )
+fi
+
 printf 'invalid certificate\n' > "$scratch/broken.cer"
 zip -qj "$scratch/bundle.zip" "$scratch/broken.cer"
 expect_status "$E_DATABASE" main
